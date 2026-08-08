@@ -1,0 +1,927 @@
+substitutions:
+  # Paths are supplied from the untracked secrets.yaml. This keeps the same
+  # firmware reproducible without embedding this installation's absolute paths.
+  wifi_config: !secret wifi_config
+  wireguard_config: !secret wireguard_config
+  # The existing MakeSkyBlue captures use Modbus RTU 9600-8N1. Change these
+  # values only if the monitored UART uses a different serial profile.
+  monitor_baud_rate: "9600"
+  monitor_data_bits: "8"
+  monitor_parity: NONE
+  monitor_stop_bits: "1"
+  # A Modbus RTU frame is separated by at least 3.5 character times. At 9600
+  # baud, 8 ms is comfortably beyond that gap. A long frame is split into
+  # ordered 96-byte chunks so the HA preview stays below 255 chars; hardware
+  # FIFO loss and bounded-ring overwrite are exposed by separate diagnostics.
+  monitor_frame_timeout: 8ms
+  monitor_chunk_size: "96"
+
+packages:
+  passive_makeskyblue_entities: !include packages/makeskyblue-passive-entities.yaml
+
+esphome:
+  name: makeskybluemodbusmonitor
+  friendly_name: MakeSkyBlueModbusMonitor
+  project:
+    name: rjwang.makeskyblue_modbus_monitor
+    version: 0.1.0-alpha.4
+  includes:
+    - components/uart_capture_ring.h
+    - components/passive_modbus_monitor.h
+  on_boot:
+    # UART buses initialize at priority 1000. Insert BOOT immediately after
+    # that, before Wi-Fi (priority 250) starts connecting.
+    - priority: 900
+      then:
+        - lambda: |-
+            do {
+              id(capture_boot_id) = esp_random();
+            } while (id(capture_boot_id) == 0U);
+            const uint32_t sequence = ++id(capture_sequence);
+            id(boot_sequence) = sequence;
+            id(boot_uptime_ms) = millis();
+            modbus_capture::ring.push_boot(sequence, id(boot_uptime_ms));
+            ESP_LOGW("modbus_buffer",
+                     "BOOT session=%u buffered as seq=%u, ring capacity=%u records",
+                     static_cast<unsigned>(id(capture_boot_id)),
+                     static_cast<unsigned>(sequence),
+                     static_cast<unsigned>(modbus_capture::CAPACITY));
+    - priority: -100
+      then:
+        - lambda: |-
+            id(onboard_boot_record).publish_state(str_sprintf(
+              "session=%u #%u @%ums BOOT ring_capacity=%u chunk_size=${monitor_chunk_size} profile=${monitor_baud_rate}-8N1",
+              static_cast<unsigned>(id(capture_boot_id)),
+              static_cast<unsigned>(id(boot_sequence)),
+              static_cast<unsigned>(id(boot_uptime_ms)),
+              static_cast<unsigned>(modbus_capture::CAPACITY)
+            ));
+        - logger.log:
+            level: WARN
+            tag: modbus_monitor
+            format: >-
+              Passive UART monitor ready: G1=GPIO1 RX and G2=GPIO2 RX at
+              ${monitor_baud_rate} baud; configured data/parity/stop settings apply;
+              neither pin will transmit
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  # The installed monitor has no USB connection. Physical serial logging is
+  # disabled; ESPHome logs remain available through the native API over Wi-Fi.
+  baud_rate: 0
+  tx_buffer_size: 8192
+  logs:
+    # Keep the live stream focused on captured UART bytes.
+    sensor: WARN
+    text_sensor: WARN
+
+api:
+  # Coalesce ordinary entity updates so they cannot crowd out raw capture
+  # traffic. The capture path itself uses an explicit HA append-completion ACK.
+  batch_delay: 50ms
+  reboot_timeout: 0s
+  # ESPHome 2026.7.0 validates this option at a maximum of 64.
+  max_send_queue: 64
+  encryption:
+    key: !secret api_encryption_key
+  actions:
+    # HA calls this only after the File action and idempotency-helper update
+    # complete. Until then the ring front remains staged and is retried.
+    - action: ack_uart_capture
+      variables:
+        boot_id: string
+        sequence: string
+      then:
+        - lambda: |-
+            const auto parse_u32 = [](const std::string &value,
+                                      uint32_t *parsed) -> bool {
+              char *end = nullptr;
+              errno = 0;
+              const unsigned long long number =
+                std::strtoull(value.c_str(), &end, 10);
+              if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                  number > UINT32_MAX) {
+                return false;
+              }
+              *parsed = static_cast<uint32_t>(number);
+              return true;
+            };
+            uint32_t acknowledged_boot = 0U;
+            uint32_t acknowledged_sequence = 0U;
+            if (!parse_u32(boot_id, &acknowledged_boot) ||
+                !parse_u32(sequence, &acknowledged_sequence)) {
+              id(capture_ack_invalid_count)++;
+              ESP_LOGW("modbus_buffer",
+                       "Rejected invalid HA ACK boot_id=%s sequence=%s",
+                       boot_id.c_str(), sequence.c_str());
+              return;
+            }
+            if (acknowledged_boot != id(capture_boot_id) ||
+                !modbus_capture::ring.acknowledge_staged(
+                  acknowledged_sequence)) {
+              id(capture_ack_mismatch_count)++;
+              ESP_LOGW("modbus_buffer",
+                       "Rejected stale/mismatched HA ACK session=%u seq=%u staged=%u",
+                       static_cast<unsigned>(acknowledged_boot),
+                       static_cast<unsigned>(acknowledged_sequence),
+                       static_cast<unsigned>(
+                         modbus_capture::ring.has_staged()
+                           ? modbus_capture::ring.staged_sequence() : 0U));
+              return;
+            }
+            id(capture_ack_count)++;
+            id(capture_last_acked_sequence) = acknowledged_sequence;
+            id(capture_last_send_ms) = 0;
+  on_client_connected:
+    - if:
+        condition:
+          lambda: return client_info.find("Home Assistant") != std::string::npos;
+        then:
+          - lambda: |-
+              id(ha_ready) = false;
+              id(ha_generation)++;
+              id(ha_pending_generation) = id(ha_generation);
+          # HA subscribes to ESPHome actions shortly after API authentication.
+          - delay: 2s
+          - lambda: |-
+              if (id(ha_pending_generation) == id(ha_generation)) {
+                id(ha_ready) = true;
+                ESP_LOGI("modbus_buffer",
+                         "Home Assistant ready; draining %u buffered record(s)",
+                         static_cast<unsigned>(modbus_capture::ring.size()));
+              }
+  on_client_disconnected:
+    - if:
+        condition:
+          lambda: return client_info.find("Home Assistant") != std::string::npos;
+        then:
+          - lambda: |-
+              id(ha_generation)++;
+              id(ha_ready) = false;
+              ESP_LOGW("modbus_buffer",
+                       "Home Assistant disconnected; buffering locally");
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi: !include ${wifi_config}
+
+captive_portal:
+
+# WireGuard starts only after SNTP has supplied valid wall-clock time. UART
+# capture and the RAM ring are already active at that point.
+time:
+  - platform: sntp
+    id: monitor_sntp_time
+    timezone: Asia/Shanghai
+
+wireguard: !include ${wireguard_config}
+
+globals:
+  - id: capture_boot_id
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_sequence
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: boot_sequence
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: boot_uptime_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: ha_generation
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: ha_pending_generation
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: ha_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: capture_last_send_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_last_sent_sequence
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_event_send_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_retry_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_ack_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_ack_mismatch_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_ack_invalid_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: capture_last_acked_sequence
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: led_activity_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: led_last_signature
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: g1_chunk_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g2_chunk_count
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: g1_byte_count
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+  - id: g2_byte_count
+    type: uint64_t
+    restore_value: no
+    initial_value: "0"
+
+# AtomS3-Lite onboard WS2812C RGB status indicator. It is kept internal so a
+# Home Assistant light command cannot mask monitor health/activity states.
+light:
+  - platform: esp32_rmt_led_strip
+    id: monitor_status_led
+    internal: true
+    pin: GPIO35
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    rmt_symbols: 48
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+text_sensor:
+  - platform: wireguard
+    wireguard_id: makeskyblue_monitor_wireguard
+    address:
+      name: "WireGuard Address"
+  - platform: template
+    id: onboard_boot_record
+    name: "Onboard Boot Record"
+    icon: mdi:restart-alert
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    name: "UART Capture Boot Session ID"
+    icon: mdi:identifier
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return str_sprintf("%u", static_cast<unsigned>(id(capture_boot_id)));
+  - platform: template
+    id: last_g1_chunk
+    name: "G1 Last UART Chunk"
+    icon: mdi:code-braces
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: last_g2_chunk
+    name: "G2 Last UART Chunk"
+    icon: mdi:code-braces
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    name: "Last Parsed Modbus Frame"
+    icon: mdi:code-json
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: return passive_modbus::monitor.last_frame_summary();
+  - platform: template
+    name: "Observed Modbus Communication Addresses"
+    icon: mdi:identifier
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: |-
+      const std::string value = passive_modbus::monitor.observed_slave_addresses();
+      if (value.empty()) return {};
+      return value;
+  - platform: template
+    name: "D30-D31 observed_network_time"
+    icon: mdi:clock-check-outline
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: |-
+      if (!passive_modbus::monitor.has_network_time()) return {};
+      const uint32_t value = passive_modbus::monitor.last_network_time_raw();
+      const unsigned year = 2024U + ((value >> 26U) & 0x3FU);
+      const unsigned month = (value >> 22U) & 0x0FU;
+      const unsigned day = (value >> 17U) & 0x1FU;
+      const unsigned hour = (value >> 12U) & 0x1FU;
+      const unsigned minute = (value >> 6U) & 0x3FU;
+      const unsigned second = value & 0x3FU;
+      return str_sprintf("%04u-%02u-%02u %02u:%02u:%02u", year, month,
+                         day, hour, minute, second);
+
+sensor:
+  - platform: wireguard
+    wireguard_id: makeskyblue_monitor_wireguard
+    latest_handshake:
+      name: "WireGuard Latest Handshake"
+  - platform: template
+    name: "G1 Captured Bytes"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return static_cast<double>(id(g1_byte_count));
+  - platform: template
+    name: "G2 Captured Bytes"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return static_cast<double>(id(g2_byte_count));
+  - platform: template
+    name: "G1 Captured Chunks"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(g1_chunk_count);
+  - platform: template
+    name: "G2 Captured Chunks"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(g2_chunk_count);
+  - platform: template
+    name: "UART Ring Buffered Records"
+    icon: mdi:database-clock
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return modbus_capture::ring.size();
+  - platform: template
+    name: "UART Ring Overwritten Records"
+    icon: mdi:database-alert
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return modbus_capture::ring.overwritten_total();
+  - platform: template
+    name: "Parsed G1 Request Frames"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.g1_frames();
+  - platform: template
+    name: "Parsed G2 Response Frames"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.g2_frames();
+  - platform: template
+    name: "Parsed Register Words"
+    icon: mdi:database-eye
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.parsed_register_words();
+  - platform: template
+    name: "Last Modbus Communication Address"
+    icon: mdi:numeric
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      const uint8_t address = passive_modbus::monitor.last_slave_address();
+      if (address == 0U) return {};
+      return static_cast<float>(address);
+  - platform: template
+    name: "Observed Modbus Communication Address Count"
+    icon: mdi:counter
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.observed_slave_address_count();
+  - platform: template
+    name: "Valid Register Addresses"
+    icon: mdi:database-check
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.valid_register_count();
+  - platform: template
+    name: "Confirmed Semantic Register Addresses"
+    icon: mdi:database-check-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return 67;
+  - platform: template
+    name: "Provisional Semantic Register Addresses"
+    icon: mdi:database-clock-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return 18;
+  - platform: template
+    name: "Raw-only Register Addresses"
+    icon: mdi:database-eye-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return 93;
+  - platform: template
+    name: "Unresolved Semantic Register Addresses"
+    icon: mdi:database-alert-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return 111;
+  - platform: template
+    name: "Confirmed Register Semantic Coverage"
+    icon: mdi:percent-circle-outline
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: return 100.0f * 67.0f / 178.0f;
+  - platform: template
+    name: "ESP32 Free Heap"
+    icon: mdi:memory
+    entity_category: diagnostic
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  - platform: template
+    name: "ESP32 Minimum Free Heap"
+    icon: mdi:memory-arrow-down
+    entity_category: diagnostic
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+  - platform: template
+    name: "ESP32 Largest Free Heap Block"
+    icon: mdi:memory
+    entity_category: diagnostic
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  - platform: template
+    name: "Wi-Fi Module Startup Markers"
+    icon: mdi:restart-alert
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.wifi_module_startup_markers();
+  - platform: template
+    name: "Observed UART Writes"
+    icon: mdi:eye-arrow-right-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.observed_writes();
+  - platform: template
+    name: "FC06 Last D Register Address"
+    icon: mdi:database-marker-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.last_fc06_register();
+  - platform: template
+    name: "FC06 Last Write Value U16"
+    icon: mdi:database-arrow-right-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.last_fc06_write_value();
+  - platform: template
+    name: "FC06 Last Response Value U16"
+    icon: mdi:database-arrow-left-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.last_fc06_response_value();
+  - platform: template
+    name: "FC06 Parsed Transactions"
+    icon: mdi:swap-horizontal-bold
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.fc06_transactions();
+  - platform: template
+    name: "Modbus CRC Errors"
+    icon: mdi:alert-circle-check-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.crc_errors();
+  - platform: template
+    name: "Modbus Discarded Bytes"
+    icon: mdi:delete-alert-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.discarded_bytes();
+  - platform: template
+    name: "Modbus Unknown Functions"
+    icon: mdi:help-rhombus-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.unknown_functions();
+  - platform: template
+    name: "Modbus Unsupported Semantic Frames"
+    icon: mdi:file-question-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.unsupported_semantic_frames();
+  - platform: template
+    name: "Modbus Structurally Invalid Frames"
+    icon: mdi:file-alert-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.structurally_invalid_frames();
+  - platform: template
+    name: "Modbus Broadcast Requests"
+    icon: mdi:access-point-network
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.broadcast_requests();
+  - platform: template
+    name: "Modbus Unpaired Responses"
+    icon: mdi:link-variant-off
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.unpaired_responses();
+  - platform: template
+    name: "Modbus Pending Requests"
+    icon: mdi:timer-sand
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.pending_requests();
+  - platform: template
+    name: "Modbus Request Queue Overflows"
+    icon: mdi:tray-alert
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.pending_overflows();
+  - platform: template
+    name: "Modbus Expired Requests"
+    icon: mdi:timer-alert-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.expired_requests();
+  - platform: template
+    name: "Modbus Exception Responses"
+    icon: mdi:alert-octagon-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.exception_responses();
+  - platform: template
+    name: "Modbus Last Frame Sequence"
+    icon: mdi:order-numeric-ascending
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.last_frame_sequence();
+  - platform: template
+    name: "Modbus Last Response Latency"
+    icon: mdi:timer-outline
+    entity_category: diagnostic
+    unit_of_measurement: ms
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.last_response_latency_ms();
+  - platform: template
+    name: "G1 Parser Buffered Bytes"
+    icon: mdi:buffer
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.stream_buffered_bytes(1);
+  - platform: template
+    name: "G2 Parser Buffered Bytes"
+    icon: mdi:buffer
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return passive_modbus::monitor.stream_buffered_bytes(2);
+  - platform: template
+    name: "Last UART Frame Age"
+    icon: mdi:timer-sand
+    entity_category: diagnostic
+    unit_of_measurement: s
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      const uint32_t last = passive_modbus::monitor.last_frame_ms();
+      if (last == 0U) return {};
+      return static_cast<float>(millis() - last) / 1000.0f;
+  - platform: template
+    name: "UART Capture Events Sent"
+    icon: mdi:send-check-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(capture_event_send_count);
+  - platform: template
+    name: "UART Capture Event Retries"
+    icon: mdi:repeat
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(capture_retry_count);
+  - platform: template
+    name: "UART Capture Records ACKed"
+    icon: mdi:database-check
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(capture_ack_count);
+  - platform: template
+    name: "UART Capture ACK Mismatches"
+    icon: mdi:database-alert
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(capture_ack_mismatch_count);
+  - platform: template
+    name: "UART Capture Invalid ACKs"
+    icon: mdi:alert-circle-outline
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(capture_ack_invalid_count);
+  - platform: template
+    name: "UART Capture Last ACKed Sequence"
+    icon: mdi:order-numeric-ascending
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(capture_last_acked_sequence);
+binary_sensor:
+  - platform: wireguard
+    wireguard_id: makeskyblue_monitor_wireguard
+    status:
+      name: "WireGuard Peer Online"
+    enabled:
+      name: "WireGuard Enabled"
+
+uart:
+  - id: uart_monitor_g1
+    rx_pin:
+      number: GPIO1
+      mode:
+        input: true
+        pullup: false
+        pulldown: false
+    baud_rate: ${monitor_baud_rate}
+    data_bits: ${monitor_data_bits}
+    parity: ${monitor_parity}
+    stop_bits: ${monitor_stop_bits}
+    rx_buffer_size: 2048
+    rx_full_threshold: 1
+    rx_timeout: 1
+    debug:
+      direction: RX
+      dummy_receiver: true
+      after:
+        bytes: ${monitor_chunk_size}
+        timeout: ${monitor_frame_timeout}
+      sequence:
+        - lambda: |-
+            const uint32_t sequence = ++id(capture_sequence);
+            id(g1_chunk_count)++;
+            id(g1_byte_count) += bytes.size();
+            modbus_capture::ring.push_uart(1, sequence, millis(), bytes);
+            passive_modbus::monitor.feed(1, sequence, millis(), bytes);
+            id(led_activity_until_ms) = millis() + 180;
+
+            static const char HEX[] = "0123456789ABCDEF";
+            std::string payload;
+            payload.reserve(bytes.size() * 2);
+            for (const uint8_t value : bytes) {
+              payload.push_back(HEX[value >> 4]);
+              payload.push_back(HEX[value & 0x0F]);
+            }
+
+            id(last_g1_chunk).publish_state(
+              str_sprintf("boot=%u #%u %uB %s",
+                          static_cast<unsigned>(id(capture_boot_id)),
+                          static_cast<unsigned>(sequence),
+                          static_cast<unsigned>(bytes.size()), payload.c_str())
+            );
+            ESP_LOGI("modbus_raw", "boot=%u #%u G1/GPIO1 %uB RAW_HEX=%s",
+                     static_cast<unsigned>(id(capture_boot_id)),
+                     static_cast<unsigned>(sequence),
+                     static_cast<unsigned>(bytes.size()),
+                     format_hex_pretty(bytes).c_str());
+
+  - id: uart_monitor_g2
+    rx_pin:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: false
+        pulldown: false
+    baud_rate: ${monitor_baud_rate}
+    data_bits: ${monitor_data_bits}
+    parity: ${monitor_parity}
+    stop_bits: ${monitor_stop_bits}
+    rx_buffer_size: 2048
+    rx_full_threshold: 1
+    rx_timeout: 1
+    debug:
+      direction: RX
+      dummy_receiver: true
+      after:
+        bytes: ${monitor_chunk_size}
+        timeout: ${monitor_frame_timeout}
+      sequence:
+        - lambda: |-
+            const uint32_t sequence = ++id(capture_sequence);
+            id(g2_chunk_count)++;
+            id(g2_byte_count) += bytes.size();
+            modbus_capture::ring.push_uart(2, sequence, millis(), bytes);
+            passive_modbus::monitor.feed(2, sequence, millis(), bytes);
+            id(led_activity_until_ms) = millis() + 180;
+
+            static const char HEX[] = "0123456789ABCDEF";
+            std::string payload;
+            payload.reserve(bytes.size() * 2);
+            for (const uint8_t value : bytes) {
+              payload.push_back(HEX[value >> 4]);
+              payload.push_back(HEX[value & 0x0F]);
+            }
+
+            id(last_g2_chunk).publish_state(
+              str_sprintf("boot=%u #%u %uB %s",
+                          static_cast<unsigned>(id(capture_boot_id)),
+                          static_cast<unsigned>(sequence),
+                          static_cast<unsigned>(bytes.size()), payload.c_str())
+            );
+            ESP_LOGI("modbus_raw", "boot=%u #%u G2/GPIO2 %uB RAW_HEX=%s",
+                     static_cast<unsigned>(id(capture_boot_id)),
+                     static_cast<unsigned>(sequence),
+                     static_cast<unsigned>(bytes.size()),
+                     format_hex_pretty(bytes).c_str());
+
+interval:
+  # Physical monitor status on the AtomS3-Lite RGB LED:
+  #   yellow slow blink = HA unavailable, captures are buffered locally
+  #   green steady      = HA connected and monitor is ready
+  #   cyan flash        = UART bytes were just captured on G1 or G2
+  #   magenta fast blink= the fixed ring has overwritten at least one record
+  - interval: 100ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          passive_modbus::monitor.tick(now);
+          const bool activity =
+            static_cast<int32_t>(id(led_activity_until_ms) - now) > 0;
+          bool on = true;
+          float red = 0.0f;
+          float green = 0.0f;
+          float blue = 0.0f;
+          float brightness = 0.22f;
+          int state = 0;
+
+          if (modbus_capture::ring.overwritten_total() > 0) {
+            state = 4;
+            on = ((now / 250U) & 1U) == 0U;
+            red = 1.0f;
+            blue = 0.45f;
+            brightness = 0.35f;
+          } else if (activity) {
+            state = 3;
+            green = 0.75f;
+            blue = 1.0f;
+            brightness = 0.40f;
+          } else if (id(ha_ready)) {
+            state = 2;
+            green = 1.0f;
+          } else {
+            state = 1;
+            on = ((now / 500U) & 1U) == 0U;
+            red = 1.0f;
+            green = 0.45f;
+            brightness = 0.28f;
+          }
+
+          const int signature = state * 2 + (on ? 1 : 0);
+          if (signature == id(led_last_signature)) {
+            return;
+          }
+          id(led_last_signature) = signature;
+
+          if (!on) {
+            auto call = id(monitor_status_led).turn_off();
+            call.perform();
+            return;
+          }
+          auto call = id(monitor_status_led).turn_on();
+          call.set_rgb(red, green, blue);
+          call.set_brightness(brightness);
+          call.perform();
+
+  # Send the ring front at least once per second until HA explicitly ACKs that
+  # exact boot-session plus uint32 sequence after HA append completion.
+  # Delivery is at-least-once; downstream storage deduplicates by both values.
+  - interval: 20ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(ha_ready)) return false;
+              if (!modbus_capture::ring.stage_front()) return false;
+              const uint32_t now = millis();
+              return id(capture_last_send_ms) == 0U ||
+                id(capture_last_sent_sequence) !=
+                  modbus_capture::ring.staged_sequence() ||
+                static_cast<uint32_t>(now - id(capture_last_send_ms)) >= 1000U;
+          then:
+            - homeassistant.event:
+                event: esphome.modbus_uart_capture
+                data:
+                  device: makeskybluemodbusmonitor
+                data_template:
+                  boot_id: "{{ boot_id }}"
+                  record_type: "{{ record_type }}"
+                  message: "{{ message }}"
+                  source: "{{ source }}"
+                  gpio: "{{ gpio }}"
+                  sequence: "{{ sequence }}"
+                  uptime_ms: "{{ uptime_ms }}"
+                  byte_count: "{{ byte_count }}"
+                  hex: "{{ hex_payload }}"
+                  overwritten_total: "{{ overwritten_total }}"
+                  buffer_remaining: "{{ buffer_remaining }}"
+                variables:
+                  boot_id: return id(capture_boot_id);
+                  record_type: return modbus_capture::ring.staged_type();
+                  message: |-
+                    if (modbus_capture::ring.staged_type() == "BOOT") {
+                      return std::string(
+                        "BOOT: UART active before Wi-Fi; ring_capacity=256; "
+                        "chunk_size=${monitor_chunk_size}; profile=${monitor_baud_rate}-8N1"
+                      );
+                    }
+                    return std::string();
+                  source: return modbus_capture::ring.staged_source();
+                  gpio: return modbus_capture::ring.staged_gpio();
+                  sequence: return modbus_capture::ring.staged_sequence();
+                  uptime_ms: return modbus_capture::ring.staged_uptime_ms();
+                  byte_count: return modbus_capture::ring.staged_length();
+                  hex_payload: return modbus_capture::ring.staged_hex();
+                  overwritten_total: |-
+                    return modbus_capture::ring.staged_overwritten_total();
+                  buffer_remaining: return modbus_capture::ring.size() - 1;
+            - lambda: |-
+                const uint32_t staged_sequence =
+                  modbus_capture::ring.staged_sequence();
+                if (id(capture_last_send_ms) != 0U &&
+                    id(capture_last_sent_sequence) == staged_sequence) {
+                  id(capture_retry_count)++;
+                }
+                id(capture_event_send_count)++;
+                id(capture_last_sent_sequence) = staged_sequence;
+                id(capture_last_send_ms) = millis();

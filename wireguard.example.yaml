@@ -1,0 +1,16 @@
+# Copy to wireguard.local.yaml and replace the address/routes for your VPN.
+id: makeskyblue_monitor_wireguard
+address: !secret makeskyblue_monitor_wireguard_address
+netmask: 255.255.255.0
+private_key: !secret makeskyblue_monitor_wireguard_private_key
+peer_endpoint: !secret makeskyblue_monitor_wireguard_endpoint
+peer_port: 51820
+peer_public_key: !secret makeskyblue_monitor_wireguard_peer_public_key
+peer_preshared_key: !secret makeskyblue_monitor_wireguard_preshared_key
+peer_allowed_ips:
+  # RFC 5737 documentation prefix; replace with the actual VPN subnet.
+  - 192.0.2.0/24
+peer_persistent_keepalive: 25s
+reboot_timeout: 0s
+require_connection_to_proceed: false
+update_interval: 10s

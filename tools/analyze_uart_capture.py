@@ -1,0 +1,1261 @@
+#!/usr/bin/env python3
+"""Reassemble and analyze passive G1/G2 Modbus RTU capture logs."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import hashlib
+import json
+import re
+import sys
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+
+RAW_RE = re.compile(
+    r"(?:boot=(?P<boot_id>\d+) )?#(?P<sequence>\d+) "
+    r"G(?P<source>[12])/GPIO[12] "
+    r"(?P<count>\d+)B RAW_HEX=(?P<hex>[0-9A-Fa-f. ]*?[0-9A-Fa-f])"
+    r"(?: \((?P<count2>\d+)\))?\s*$"
+)
+STATE_RE = re.compile(
+    r"'G(?P<source>[12]) Last UART Chunk' >> "
+    r"'(?:boot=(?P<boot_id>\d+) )?#(?P<sequence>\d+) "
+    r"(?P<count>\d+)B (?P<hex>[0-9A-Fa-f]+)'\s*$"
+)
+TIMESTAMP_RE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))"
+)
+CAPTURE_START_RE = re.compile(
+    r"^(?P<timestamp>\S+) CAPTURE_START .*duration_seconds=(?P<duration>\d+) "
+    r"git_commit=(?P<commit>\S+) git_dirty=(?P<dirty>true|false) "
+    r"config_sha256=(?P<config_sha256>\S+) firmware_sha256=(?P<firmware_sha256>\S+)"
+)
+CAPTURE_END_RE = re.compile(
+    r"^(?P<timestamp>\S+) CAPTURE_END reason=(?P<reason>\S+)"
+)
+
+
+def modbus_crc(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def crc_valid(frame: bytes) -> bool:
+    if len(frame) < 4:
+        return False
+    expected = frame[-2] | (frame[-1] << 8)
+    return modbus_crc(frame[:-2]) == expected
+
+
+def timestamp_iso8601(timestamp_ms: int | None) -> str:
+    if timestamp_ms is None:
+        return ""
+    return (
+        dt.datetime.fromtimestamp(timestamp_ms / 1000, tz=dt.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def load_register_catalog(path: Path) -> dict[int, dict[str, str]]:
+    """Load this project's evidence-backed D-register CSV catalog."""
+    catalog: dict[int, dict[str, str]] = {}
+    with path.open(encoding="utf-8", newline="") as source:
+        for row in csv.DictReader(source):
+            address = int(row["register"])
+            catalog[address] = {
+                "status": row["status"].strip(),
+                "mapped_fields": row["mapped_fields"].strip(),
+                "evidence": row["evidence"].strip(),
+            }
+    return catalog
+
+
+def load_register_mapping(path: Path) -> dict[int, list[str]]:
+    """Load D-register field labels for backwards-compatible callers."""
+    mapping: dict[int, list[str]] = {}
+    for address, entry in load_register_catalog(path).items():
+        mapping[address] = [
+            value.strip()
+            for value in entry["mapped_fields"].split("|")
+            if value.strip()
+        ]
+    return mapping
+
+
+@dataclass
+class Chunk:
+    sequence: int
+    source: int
+    data: bytes
+    boot_id: int = 0
+    order: int = -1
+    timestamp_ms: int | None = None
+
+
+@dataclass
+class Frame:
+    source: int
+    first_sequence: int
+    last_sequence: int
+    data: bytes
+    boot_id: int = 0
+    first_order: int = -1
+    last_order: int = -1
+    timestamp_ms: int | None = None
+
+    @property
+    def address(self) -> int:
+        return self.data[0]
+
+    @property
+    def function(self) -> int:
+        return self.data[1]
+
+    @property
+    def hex(self) -> str:
+        return self.data.hex().upper()
+
+
+@dataclass
+class ParseIssue:
+    kind: str
+    first_sequence: int
+    last_sequence: int
+    timestamp_ms: int | None
+    expected_length: int
+    candidate_hex: str
+    dropped_byte_hex: str
+
+
+@dataclass
+class StreamState:
+    role: str
+    data: bytearray = field(default_factory=bytearray)
+    first_sequence: int = 0
+    last_sequence: int = 0
+    first_order: int = 0
+    last_timestamp_ms: int | None = None
+    discarded_bytes: int = 0
+    crc_errors: int = 0
+    startup_markers: list[tuple[int, int, int | None]] = field(default_factory=list)
+    issues: list[ParseIssue] = field(default_factory=list)
+
+
+FIXED_REQUEST_LENGTHS = {
+    0x01: 8,
+    0x02: 8,
+    0x03: 8,
+    0x04: 8,
+    0x05: 8,
+    0x06: 8,
+    0x07: 4,
+    0x08: 8,
+    0x0B: 4,
+    0x0C: 4,
+    0x11: 4,
+    0x16: 10,
+}
+FIXED_RESPONSE_LENGTHS = {
+    0x07: 5,
+    0x05: 8,
+    0x06: 8,
+    0x08: 8,
+    0x0B: 8,
+    0x0F: 8,
+    0x10: 8,
+    0x16: 10,
+}
+WIFI_MODULE_STARTUP_MARKER = b"\x00\x00\x00\xFF"
+FULLY_VALIDATED_FUNCTIONS = {0x03, 0x04, 0x06, 0x10}
+
+
+def frame_semantic_status(frame: Frame) -> str:
+    if not frame_structure_valid(frame):
+        return "structurally_invalid"
+    return (
+        "fully_parsed"
+        if (frame.function & 0x7F) in FULLY_VALIDATED_FUNCTIONS
+        else "unsupported_semantics"
+    )
+
+
+def frame_structure_valid(frame: Frame) -> bool:
+    function = frame.function & 0x7F
+    if frame.address > 247:
+        return False
+    if frame.function & 0x80:
+        return frame.source == 2 and frame.address >= 1 and len(frame.data) == 5
+    if frame.source == 2 and frame.address == 0:
+        return False
+    if (
+        frame.source == 1
+        and frame.address == 0
+        and function not in (0x05, 0x06, 0x0F, 0x10, 0x16)
+    ):
+        return False
+    if function in (0x03, 0x04):
+        if frame.source == 1:
+            if len(frame.data) != 8:
+                return False
+            count = int.from_bytes(frame.data[4:6], "big")
+            return frame.address != 0 and 1 <= count <= 125
+        if len(frame.data) < 5:
+            return False
+        byte_count = frame.data[2]
+        return byte_count % 2 == 0 and len(frame.data) == 5 + byte_count
+    if function == 0x10:
+        if frame.source == 1:
+            if len(frame.data) < 9:
+                return False
+            count = int.from_bytes(frame.data[4:6], "big")
+            byte_count = frame.data[6]
+            return (
+                frame.address <= 247
+                and 1 <= count <= 123
+                and byte_count == count * 2
+                and len(frame.data) == 9 + byte_count
+            )
+        return len(frame.data) == 8
+    if function == 0x06:
+        return len(frame.data) == 8
+    return True
+
+
+def expected_length(role: str, data: bytearray) -> int | None:
+    if len(data) < 2:
+        return None
+    function = data[1]
+    if function & 0x80:
+        return 5
+
+    if role == "request":
+        if function in FIXED_REQUEST_LENGTHS:
+            return FIXED_REQUEST_LENGTHS[function]
+        if function in (0x0F, 0x10):
+            return None if len(data) < 7 else 9 + data[6]
+        if function == 0x17:
+            return None if len(data) < 11 else 13 + data[10]
+        return -1
+
+    if function in FIXED_RESPONSE_LENGTHS:
+        return FIXED_RESPONSE_LENGTHS[function]
+    if function in (0x01, 0x02, 0x03, 0x04, 0x0C, 0x11, 0x17):
+        return None if len(data) < 3 else 5 + data[2]
+    return -1
+
+
+def parse_chunks(lines: Iterable[str]) -> list[Chunk]:
+    chunks_by_key: dict[tuple[int, int], Chunk] = {}
+    for order, line in enumerate(lines):
+        match = RAW_RE.search(line)
+        source_kind = "raw"
+        if not match:
+            match = STATE_RE.search(line)
+            source_kind = "state"
+        if not match:
+            continue
+        compact = re.sub(r"[. ]", "", match.group("hex"))
+        data = bytes.fromhex(compact)
+        declared = int(match.group("count"))
+        count2 = match.groupdict().get("count2")
+        declared2 = int(count2) if count2 is not None else declared
+        if len(data) != declared or declared != declared2:
+            raise ValueError(
+                f"chunk length mismatch at sequence {match.group('sequence')}: "
+                f"parsed={len(data)} declared={declared}/{declared2}"
+            )
+        chunk = Chunk(
+            sequence=int(match.group("sequence")),
+            source=int(match.group("source")),
+            data=data,
+            boot_id=int(match.group("boot_id") or 0),
+            order=order,
+            timestamp_ms=(
+                int(
+                    dt.datetime.fromisoformat(
+                        TIMESTAMP_RE.match(line).group("timestamp").replace(
+                            "Z", "+00:00"
+                        )
+                    ).timestamp()
+                    * 1000
+                )
+                if TIMESTAMP_RE.match(line)
+                else None
+            ),
+        )
+        key = (chunk.boot_id, chunk.sequence)
+        existing = chunks_by_key.get(key)
+        if existing is not None and (
+            existing.source != chunk.source or existing.data != chunk.data
+        ):
+            raise ValueError(
+                f"conflicting {source_kind} chunk at boot={chunk.boot_id} "
+                f"sequence {chunk.sequence}"
+            )
+        if existing is None:
+            chunks_by_key[key] = chunk
+    return list(chunks_by_key.values())
+
+
+def feed(state: StreamState, chunk: Chunk) -> list[Frame]:
+    if not state.data:
+        state.first_sequence = chunk.sequence
+        state.first_order = chunk.order
+    state.last_sequence = chunk.sequence
+    state.last_timestamp_ms = chunk.timestamp_ms
+    state.data.extend(chunk.data)
+    frames: list[Frame] = []
+
+    while state.data:
+        if state.role == "request":
+            prefix_length = min(len(state.data), len(WIFI_MODULE_STARTUP_MARKER))
+            if state.data[:prefix_length] == WIFI_MODULE_STARTUP_MARKER[:prefix_length]:
+                if len(state.data) < len(WIFI_MODULE_STARTUP_MARKER):
+                    break
+                state.startup_markers.append(
+                    (state.first_sequence, chunk.sequence, chunk.timestamp_ms)
+                )
+                del state.data[: len(WIFI_MODULE_STARTUP_MARKER)]
+                state.first_sequence = chunk.sequence
+                state.first_order = chunk.order
+                continue
+        length = expected_length(state.role, state.data)
+        if length is None:
+            break
+        if length < 4 or length > 260:
+            state.issues.append(
+                ParseIssue(
+                    kind="unsupported_function_or_length",
+                    first_sequence=state.first_sequence,
+                    last_sequence=chunk.sequence,
+                    timestamp_ms=chunk.timestamp_ms,
+                    expected_length=length,
+                    candidate_hex=bytes(state.data[:32]).hex().upper(),
+                    dropped_byte_hex=f"{state.data[0]:02X}",
+                )
+            )
+            del state.data[0]
+            state.discarded_bytes += 1
+            state.first_sequence = chunk.sequence
+            state.first_order = chunk.order
+            continue
+        if len(state.data) < length:
+            break
+
+        candidate = bytes(state.data[:length])
+        if not crc_valid(candidate):
+            state.issues.append(
+                ParseIssue(
+                    kind="crc_error_resync",
+                    first_sequence=state.first_sequence,
+                    last_sequence=chunk.sequence,
+                    timestamp_ms=chunk.timestamp_ms,
+                    expected_length=length,
+                    candidate_hex=candidate.hex().upper(),
+                    dropped_byte_hex=f"{state.data[0]:02X}",
+                )
+            )
+            del state.data[0]
+            state.crc_errors += 1
+            state.discarded_bytes += 1
+            state.first_sequence = chunk.sequence
+            state.first_order = chunk.order
+            continue
+
+        frames.append(
+            Frame(
+                source=chunk.source,
+                first_sequence=state.first_sequence,
+                last_sequence=chunk.sequence,
+                data=candidate,
+                boot_id=chunk.boot_id,
+                first_order=state.first_order,
+                last_order=chunk.order,
+                timestamp_ms=chunk.timestamp_ms,
+            )
+        )
+        del state.data[:length]
+        state.first_sequence = chunk.sequence
+        state.first_order = chunk.order
+
+    return frames
+
+
+def request_details(frame: Frame) -> dict[str, object]:
+    function = frame.function
+    details: dict[str, object] = {
+        "address": frame.address,
+        "function": f"0x{function:02X}",
+        "kind": "request",
+    }
+    if function in (0x01, 0x02):
+        details["start_bit"] = int.from_bytes(frame.data[2:4], "big")
+        details["start_bit_label"] = (
+            "C" if function == 0x01 else "DI"
+        ) + str(details["start_bit"])
+        details["bit_count"] = int.from_bytes(frame.data[4:6], "big")
+        details["operation"] = "read_bits"
+    elif function in (0x03, 0x04):
+        details["start_register"] = int.from_bytes(frame.data[2:4], "big")
+        details["start_register_label"] = f"D{details['start_register']}"
+        details["register_count"] = int.from_bytes(frame.data[4:6], "big")
+        details["operation"] = "read"
+    elif function in (0x05, 0x06):
+        address = int.from_bytes(frame.data[2:4], "big")
+        if function == 0x05:
+            details["start_bit"] = address
+            details["start_bit_label"] = f"C{address}"
+            details["bit_count"] = 1
+        else:
+            details["start_register"] = address
+            details["start_register_label"] = f"D{address}"
+            details["register_count"] = 1
+        details["operation"] = (
+            "observed_write_coil"
+            if function == 0x05
+            else "observed_write_register"
+        )
+        details["write_data_hex"] = frame.data[4:6].hex().upper()
+    elif function in (0x0F, 0x10):
+        address = int.from_bytes(frame.data[2:4], "big")
+        count = int.from_bytes(frame.data[4:6], "big")
+        if function == 0x0F:
+            details["start_bit"] = address
+            details["start_bit_label"] = f"C{address}"
+            details["bit_count"] = count
+        else:
+            details["start_register"] = address
+            details["start_register_label"] = f"D{address}"
+            details["register_count"] = count
+        details["operation"] = (
+            "observed_write_coils"
+            if function == 0x0F
+            else "observed_write_registers"
+        )
+        details["write_data_hex"] = frame.data[7:-2].hex().upper()
+    elif function == 0x16:
+        details["start_register"] = int.from_bytes(frame.data[2:4], "big")
+        details["start_register_label"] = f"D{details['start_register']}"
+        details["register_count"] = 1
+        details["operation"] = "observed_mask_write_register"
+        details["and_mask"] = int.from_bytes(frame.data[4:6], "big")
+        details["or_mask"] = int.from_bytes(frame.data[6:8], "big")
+        details["write_data_hex"] = frame.data[4:8].hex().upper()
+    elif function == 0x17:
+        details["start_register"] = int.from_bytes(frame.data[2:4], "big")
+        details["start_register_label"] = f"D{details['start_register']}"
+        details["register_count"] = int.from_bytes(frame.data[4:6], "big")
+        details["write_start_register"] = int.from_bytes(frame.data[6:8], "big")
+        details["write_register_count"] = int.from_bytes(frame.data[8:10], "big")
+        details["operation"] = "observed_read_write_registers"
+        details["write_data_hex"] = frame.data[11:-2].hex().upper()
+    else:
+        details["operation"] = "other"
+    return details
+
+
+def response_matches(request: Frame, response: Frame) -> bool:
+    if request.boot_id != response.boot_id:
+        return False
+    if request.address != response.address:
+        return False
+    response_function = response.function & 0x7F
+    if request.function != response_function:
+        return False
+    if response.function & 0x80:
+        return True
+    if request.function in (0x01, 0x02):
+        count = int.from_bytes(request.data[4:6], "big")
+        return response.data[2] == (count + 7) // 8
+    if request.function in (0x03, 0x04, 0x17):
+        count = int.from_bytes(request.data[4:6], "big")
+        return response.data[2] == count * 2
+    # Observed device behavior: the FC06 response retains the register address
+    # but returns a separate 16-bit device value instead of echoing the write.
+    # Keep both values explicit in the CSV rather than forcing standard echo
+    # semantics onto this wire trace.
+    if request.function == 0x06:
+        return response.data[2:4] == request.data[2:4]
+    if request.function in (0x05, 0x08, 0x16):
+        return response.data[:-2] == request.data[:-2]
+    if request.function in (0x0F, 0x10):
+        return response.data[2:6] == request.data[2:6]
+    return request.function in (0x07, 0x0B, 0x0C, 0x11)
+
+
+def frame_completion_order(frame: Frame) -> tuple[int, int, int]:
+    return (frame.boot_id, frame.last_sequence, frame.source)
+
+
+def sequence_integrity(
+    chunks: list[Chunk],
+) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
+    """Separate missing sequence numbers from logger emission reordering."""
+    sequences_by_boot: dict[int, set[int]] = {}
+    for chunk in chunks:
+        sequences_by_boot.setdefault(chunk.boot_id, set()).add(chunk.sequence)
+
+    gaps: list[dict[str, int]] = []
+    for boot_id, sequences in sequences_by_boot.items():
+        ordered = sorted(sequences)
+        for previous, current in zip(ordered, ordered[1:]):
+            if current == previous + 1:
+                continue
+            gaps.append(
+                {
+                    "boot_id": boot_id,
+                    "after": previous,
+                    "before": current,
+                    "expected": previous + 1,
+                    "missing_count": current - previous - 1,
+                }
+            )
+
+    out_of_order: list[dict[str, int]] = []
+    previous_by_boot: dict[int, Chunk] = {}
+    for chunk in chunks:
+        previous = previous_by_boot.get(chunk.boot_id)
+        if previous is not None and chunk.sequence < previous.sequence:
+            out_of_order.append(
+                {
+                    "boot_id": chunk.boot_id,
+                    "after": previous.sequence,
+                    "before": chunk.sequence,
+                    "previous_log_order": previous.order,
+                    "current_log_order": chunk.order,
+                }
+            )
+        previous_by_boot[chunk.boot_id] = chunk
+    return gaps, out_of_order
+
+
+def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(
+            output,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
+    starts: list[re.Match[str]] = []
+    ends: list[re.Match[str]] = []
+    for line in lines:
+        start = CAPTURE_START_RE.match(line)
+        if start:
+            starts.append(start)
+        end = CAPTURE_END_RE.match(line)
+        if end:
+            ends.append(end)
+    result: dict[str, object] = {
+        "capture_start_count": len(starts),
+        "capture_end_count": len(ends),
+        "capture_complete": False,
+    }
+    if len(starts) == 1:
+        start_time = dt.datetime.fromisoformat(
+            starts[0].group("timestamp").replace("Z", "+00:00")
+        )
+        result.update(
+            {
+                "capture_planned_duration_seconds": int(starts[0].group("duration")),
+                "capture_start_timestamp": starts[0].group("timestamp"),
+                "capture_start_timestamp_ms": int(start_time.timestamp() * 1000),
+                "git_commit": starts[0].group("commit"),
+                "git_dirty": starts[0].group("dirty") == "true",
+                "config_sha256": starts[0].group("config_sha256"),
+                "firmware_sha256": starts[0].group("firmware_sha256"),
+            }
+        )
+    if len(starts) == 1 and len(ends) == 1:
+        start_time = dt.datetime.fromisoformat(
+            starts[0].group("timestamp").replace("Z", "+00:00")
+        )
+        end_time = dt.datetime.fromisoformat(
+            ends[0].group("timestamp").replace("Z", "+00:00")
+        )
+        result.update(
+            {
+                "capture_end_timestamp": ends[0].group("timestamp"),
+                "capture_end_timestamp_ms": int(end_time.timestamp() * 1000),
+                "capture_end_reason": ends[0].group("reason"),
+                "capture_elapsed_seconds": (end_time - start_time).total_seconds(),
+                "capture_complete": ends[0].group("reason") == "duration_complete",
+            }
+        )
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("capture", type=Path)
+    parser.add_argument("--frames-csv", type=Path)
+    parser.add_argument("--registers-csv", type=Path)
+    parser.add_argument(
+        "--summary-json",
+        type=Path,
+        help="write the summary plus a sibling .sha256 integrity file",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="return non-zero when sequence/frame integrity checks fail",
+    )
+    parser.add_argument(
+        "--mapping-csv",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent
+        / "registers"
+        / "makeskyblue-observed-registers.csv",
+    )
+    parser.add_argument("--min-duration-seconds", type=int, default=86400)
+    parser.add_argument(
+        "--max-idle-seconds",
+        type=float,
+        default=180.0,
+        help=(
+            "fail strict validation when no UART chunk is observed for longer "
+            "than this interval, including capture boundaries"
+        ),
+    )
+    args = parser.parse_args()
+
+    register_catalog = load_register_catalog(args.mapping_csv)
+    register_mapping = load_register_mapping(args.mapping_csv)
+
+    capture_bytes = args.capture.read_bytes()
+    capture_lines = capture_bytes.decode("utf-8").splitlines()
+    capture_metadata = parse_capture_metadata(capture_lines)
+    chunks = parse_chunks(capture_lines)
+    boot_log_order: dict[int, int] = {}
+    for chunk in chunks:
+        boot_log_order.setdefault(chunk.boot_id, chunk.order)
+    ordered_chunks = sorted(
+        chunks,
+        key=lambda chunk: (
+            boot_log_order[chunk.boot_id],
+            chunk.sequence,
+            chunk.order,
+        ),
+    )
+    states: dict[tuple[int, int], StreamState] = {}
+    frames: list[Frame] = []
+    for chunk in ordered_chunks:
+        key = (chunk.boot_id, chunk.source)
+        state = states.setdefault(
+            key,
+            StreamState(role="request" if chunk.source == 1 else "response"),
+        )
+        frames.extend(feed(state, chunk))
+    # Pair in completion order. A long G2 response can start before the G1
+    # request's idle-timeout callback, yet finish after that request callback.
+    # Sorting by first_sequence incorrectly reports that valid exchange as an
+    # unpaired response; firmware also handles frames only when complete.
+    frames.sort(
+        key=lambda frame: (
+            boot_log_order.get(frame.boot_id, 0),
+            frame.last_sequence,
+            frame.source,
+            frame.first_sequence,
+        )
+    )
+
+    sequence_gaps, sequence_out_of_order = sequence_integrity(chunks)
+
+    pending: deque[Frame] = deque()
+    frame_rows: list[dict[str, object]] = []
+    register_rows: list[dict[str, object]] = []
+    function_counts: Counter[str] = Counter()
+    unpaired_responses = 0
+    expired_requests = 0
+    structurally_invalid_frames = 0
+    broadcast_requests = 0
+    fc06_rows_by_request: dict[tuple[int, int], dict[str, object]] = {}
+    pending_fc06_readback: dict[tuple[int, int], dict[str, object]] = {}
+
+    for (boot_id, source), state in states.items():
+        if source == 1:
+            for first_sequence, last_sequence, timestamp_ms in state.startup_markers:
+                frame_rows.append(
+                    {
+                        "boot_id": boot_id,
+                        "source": "G1",
+                        "first_sequence": first_sequence,
+                        "last_sequence": last_sequence,
+                        "kind": "wifi_module_startup_marker",
+                        "operation": "startup_marker",
+                        "semantic_status": "fully_parsed",
+                        "completion_timestamp_ms": timestamp_ms or "",
+                        "completion_timestamp_iso8601": timestamp_iso8601(
+                            timestamp_ms
+                        ),
+                        "frame_hex": WIFI_MODULE_STARTUP_MARKER.hex().upper(),
+                        "crc_valid": "",
+                    }
+                )
+
+        for issue in state.issues:
+            frame_rows.append(
+                {
+                    "boot_id": boot_id,
+                    "source": f"G{source}",
+                    "first_sequence": issue.first_sequence,
+                    "last_sequence": issue.last_sequence,
+                    "completion_timestamp_ms": issue.timestamp_ms or "",
+                    "completion_timestamp_iso8601": timestamp_iso8601(
+                        issue.timestamp_ms
+                    ),
+                    "kind": issue.kind,
+                    "operation": "stream_resynchronization",
+                    "semantic_status": "parse_error",
+                    "parse_issue_expected_length": issue.expected_length,
+                    "parse_issue_dropped_byte_hex": issue.dropped_byte_hex,
+                    "frame_hex": issue.candidate_hex,
+                    "crc_valid": False if issue.kind == "crc_error_resync" else "",
+                }
+            )
+        if state.data:
+            frame_rows.append(
+                {
+                    "boot_id": boot_id,
+                    "source": f"G{source}",
+                    "first_sequence": state.first_sequence,
+                    "last_sequence": state.last_sequence,
+                    "completion_timestamp_ms": state.last_timestamp_ms or "",
+                    "completion_timestamp_iso8601": timestamp_iso8601(
+                        state.last_timestamp_ms
+                    ),
+                    "kind": "incomplete_stream_tail",
+                    "operation": "stream_reassembly",
+                    "semantic_status": "incomplete",
+                    "parse_issue_expected_length": expected_length(
+                        state.role, state.data
+                    ),
+                    "frame_hex": bytes(state.data).hex().upper(),
+                    "crc_valid": "",
+                }
+            )
+
+    for frame in frames:
+        if frame.timestamp_ms is not None:
+            retained: deque[Frame] = deque()
+            while pending:
+                request = pending.popleft()
+                if (
+                    request.timestamp_ms is not None
+                    and frame.timestamp_ms - request.timestamp_ms > 1000
+                ):
+                    expired_requests += 1
+                else:
+                    retained.append(request)
+            pending = retained
+        function_counts[f"G{frame.source}_FC{frame.function:02X}"] += 1
+        row: dict[str, object] = {
+            "boot_id": frame.boot_id,
+            "source": f"G{frame.source}",
+            "first_sequence": frame.first_sequence,
+            "last_sequence": frame.last_sequence,
+            "address": frame.address,
+            "function": f"0x{frame.function:02X}",
+            "frame_hex": frame.hex,
+            "crc_valid": True,
+            "semantic_status": frame_semantic_status(frame),
+            "completion_timestamp_ms": frame.timestamp_ms or "",
+            "completion_timestamp_iso8601": timestamp_iso8601(frame.timestamp_ms),
+        }
+
+        if not frame_structure_valid(frame):
+            structurally_invalid_frames += 1
+            row["kind"] = (
+                "structurally_invalid_request"
+                if frame.source == 1
+                else "structurally_invalid_response"
+            )
+            frame_rows.append(row)
+            continue
+
+        if frame.source == 1:
+            details = request_details(frame)
+            row.update(details)
+            if frame.address == 0:
+                broadcast_requests += 1
+                row["kind"] = "broadcast_request"
+            else:
+                pending.append(frame)
+            if details.get("operation") in (
+                "observed_write_register",
+                "observed_write_registers",
+                "observed_read_write_registers",
+            ):
+                start = int(
+                    details.get("write_start_register", details["start_register"])
+                )
+                data = bytes.fromhex(str(details.get("write_data_hex", "")))
+                for index in range(0, len(data) - 1, 2):
+                    raw = int.from_bytes(data[index : index + 2], "big")
+                    register_row: dict[str, object] = {
+                            "boot_id": frame.boot_id,
+                            "operation": str(details["operation"]),
+                            "request_sequence": frame.first_sequence,
+                            "response_sequence": "",
+                            "function": f"0x{frame.function:02X}",
+                            "completion_timestamp_ms": frame.timestamp_ms or "",
+                            "completion_timestamp_iso8601": timestamp_iso8601(
+                                frame.timestamp_ms
+                            ),
+                            "register": start + index // 2,
+                            "register_label": f"D{start + index // 2}",
+                            "mapped_fields": "|".join(
+                                register_mapping.get(start + index // 2, [])
+                            ),
+                            "mapping_status": register_catalog.get(
+                                start + index // 2, {}
+                            ).get("status", "not_cataloged"),
+                            "raw_u16": raw,
+                            "raw_s16": raw - 0x10000 if raw & 0x8000 else raw,
+                        }
+                    register_rows.append(register_row)
+                    if frame.function == 0x06:
+                        fc06_rows_by_request[
+                            (frame.boot_id, frame.first_sequence)
+                        ] = register_row
+                        pending_fc06_readback[
+                            (frame.boot_id, start + index // 2)
+                        ] = register_row
+        else:
+            match_index = next(
+                (index for index, request in enumerate(pending) if response_matches(request, frame)),
+                None,
+            )
+            if match_index is None:
+                unpaired_responses += 1
+                row["kind"] = "unpaired_response"
+            else:
+                request = pending[match_index]
+                del pending[match_index]
+                details = request_details(request)
+                row.update(
+                    {
+                        "kind": "response",
+                        "request_sequence": request.first_sequence,
+                        "operation": details["operation"],
+                        "start_register": details.get("start_register", ""),
+                        "start_register_label": details.get(
+                            "start_register_label", ""
+                        ),
+                        "register_count": details.get("register_count", ""),
+                    }
+                )
+                if frame.function & 0x80:
+                    row["exception_code"] = frame.data[2]
+                elif request.function == 0x06:
+                    response_value = int.from_bytes(frame.data[4:6], "big")
+                    row["write_response_value_u16"] = response_value
+                    row["write_response_value_s16"] = (
+                        response_value - 0x10000
+                        if response_value & 0x8000
+                        else response_value
+                    )
+                    row["write_response_data_hex"] = frame.data[4:6].hex().upper()
+                    tracked_write = fc06_rows_by_request.get(
+                        (request.boot_id, request.first_sequence)
+                    )
+                    if tracked_write is not None:
+                        tracked_write["response_sequence"] = frame.first_sequence
+                        tracked_write["write_response_timestamp_ms"] = (
+                            frame.timestamp_ms or ""
+                        )
+                        tracked_write["write_response_timestamp_iso8601"] = (
+                            timestamp_iso8601(frame.timestamp_ms)
+                        )
+                        tracked_write["write_response_value_u16"] = response_value
+                        tracked_write["write_response_value_s16"] = (
+                            response_value - 0x10000
+                            if response_value & 0x8000
+                            else response_value
+                        )
+                elif request.function in (0x03, 0x04, 0x17):
+                    start = int(details["start_register"])
+                    payload = frame.data[3:-2]
+                    for index in range(0, len(payload), 2):
+                        raw = int.from_bytes(payload[index : index + 2], "big")
+                        register_address = start + index // 2
+                        register_rows.append(
+                            {
+                                "boot_id": frame.boot_id,
+                                "operation": "read_response",
+                                "request_sequence": request.first_sequence,
+                                "response_sequence": frame.first_sequence,
+                                "function": f"0x{request.function:02X}",
+                                "completion_timestamp_ms": frame.timestamp_ms or "",
+                                "completion_timestamp_iso8601": timestamp_iso8601(
+                                    frame.timestamp_ms
+                                ),
+                                "register": register_address,
+                                "register_label": f"D{register_address}",
+                                "mapped_fields": "|".join(
+                                    register_mapping.get(start + index // 2, [])
+                                ),
+                                "mapping_status": register_catalog.get(
+                                    start + index // 2, {}
+                                ).get("status", "not_cataloged"),
+                                "raw_u16": raw,
+                                "raw_s16": raw - 0x10000 if raw & 0x8000 else raw,
+                            }
+                        )
+                        tracked_write = pending_fc06_readback.pop(
+                            (frame.boot_id, register_address), None
+                        )
+                        if tracked_write is not None:
+                            tracked_write["readback_sequence"] = frame.first_sequence
+                            tracked_write["readback_timestamp_ms"] = (
+                                frame.timestamp_ms or ""
+                            )
+                            tracked_write["readback_timestamp_iso8601"] = (
+                                timestamp_iso8601(frame.timestamp_ms)
+                            )
+                            tracked_write["readback_raw_u16"] = raw
+                            tracked_write["readback_status"] = (
+                                "match"
+                                if raw == int(tracked_write["raw_u16"])
+                                else "mismatch"
+                            )
+        frame_rows.append(row)
+
+    observed_modbus_slave_addresses = sorted(
+        {
+            frame.address
+            for frame in frames
+            if frame_structure_valid(frame) and 1 <= frame.address <= 247
+        }
+    )
+    summary = {
+        "analysis_timestamp_iso8601": timestamp_iso8601(
+            int(dt.datetime.now(tz=dt.timezone.utc).timestamp() * 1000)
+        ),
+        "capture_path": str(args.capture.resolve()),
+        "capture_bytes": len(capture_bytes),
+        "capture_sha256": hashlib.sha256(capture_bytes).hexdigest(),
+        "chunks": len(chunks),
+        "boot_sessions": sorted({chunk.boot_id for chunk in chunks}),
+        "boot_session_count": len({chunk.boot_id for chunk in chunks}),
+        "first_sequence": chunks[0].sequence if chunks else None,
+        "last_sequence": chunks[-1].sequence if chunks else None,
+        "sequence_gap_count": len(sequence_gaps),
+        "sequence_gaps": sequence_gaps[:20],
+        "missing_sequence_count": sum(
+            gap["missing_count"] for gap in sequence_gaps
+        ),
+        "sequence_out_of_order_count": len(sequence_out_of_order),
+        "sequence_out_of_order": sequence_out_of_order[:20],
+        "frames": len(frames),
+        "observed_modbus_slave_addresses": observed_modbus_slave_addresses,
+        "observed_modbus_slave_address_count": len(
+            observed_modbus_slave_addresses
+        ),
+        "function_counts": dict(sorted(function_counts.items())),
+        "pending_requests": len(pending),
+        "expired_requests": expired_requests,
+        "unpaired_responses": unpaired_responses,
+        "structurally_invalid_frames": structurally_invalid_frames,
+        "broadcast_requests": broadcast_requests,
+        "wifi_module_startup_markers": sum(
+            len(state.startup_markers)
+            for (_boot_id, source), state in states.items()
+            if source == 1
+        ),
+        "unsupported_semantic_frames": sum(
+            1
+            for frame in frames
+            if (frame.function & 0x7F) not in FULLY_VALIDATED_FUNCTIONS
+        ),
+        "register_catalog_addresses": len(register_catalog),
+        "confirmed_semantic_addresses": sum(
+            entry["status"] == "confirmed_semantic"
+            for entry in register_catalog.values()
+        ),
+        "provisional_semantic_addresses": sum(
+            entry["status"] == "provisional_semantic"
+            for entry in register_catalog.values()
+        ),
+        "raw_only_addresses": sum(
+            entry["status"] == "observed_raw"
+            for entry in register_catalog.values()
+        ),
+        "unresolved_semantic_addresses": sum(
+            entry["status"] != "confirmed_semantic"
+            for entry in register_catalog.values()
+        ),
+        "unresolved_semantic_address_labels": [
+            f"D{address}"
+            for address, entry in sorted(register_catalog.items())
+            if entry["status"] != "confirmed_semantic"
+        ],
+        "startup_marker_sequences": [
+            {
+                "boot_id": boot_id,
+                "first": first,
+                "last": last,
+                "completion_timestamp_ms": timestamp_ms,
+                "completion_timestamp_iso8601": timestamp_iso8601(timestamp_ms),
+            }
+            for (boot_id, source), state in states.items()
+            if source == 1
+            for first, last, timestamp_ms in state.startup_markers
+        ],
+        "parse_issue_count": sum(len(state.issues) for state in states.values())
+        + sum(bool(state.data) for state in states.values()),
+        "parse_issue_contexts": [
+            {
+                "boot_id": boot_id,
+                "source": f"G{source}",
+                "kind": issue.kind,
+                "first_sequence": issue.first_sequence,
+                "last_sequence": issue.last_sequence,
+                "completion_timestamp_ms": issue.timestamp_ms,
+                "completion_timestamp_iso8601": timestamp_iso8601(
+                    issue.timestamp_ms
+                ),
+                "expected_length": issue.expected_length,
+                "dropped_byte_hex": issue.dropped_byte_hex,
+                "candidate_hex": issue.candidate_hex,
+            }
+            for (boot_id, source), state in states.items()
+            for issue in state.issues
+        ][:50],
+        "streams": {
+            f"boot={boot_id}/G{source}": {
+                "discarded_bytes": state.discarded_bytes,
+                "crc_errors": state.crc_errors,
+                "incomplete_bytes": len(state.data),
+                "incomplete_hex": bytes(state.data).hex().upper(),
+            }
+            for (boot_id, source), state in states.items()
+        },
+        **capture_metadata,
+    }
+
+    not_cataloged_register_addresses = sorted(
+        {
+            int(row["register"])
+            for row in register_rows
+            if row.get("mapping_status") == "not_cataloged"
+        }
+    )
+    summary["not_cataloged_register_addresses"] = not_cataloged_register_addresses
+    summary["not_cataloged_register_address_labels"] = [
+        f"D{address}" for address in not_cataloged_register_addresses
+    ]
+
+    read_observed_register_addresses = sorted(
+        {
+            int(row["register"])
+            for row in register_rows
+            if row.get("operation") == "read_response"
+            and int(row["register"]) in register_catalog
+        }
+    )
+    missing_read_register_addresses = sorted(
+        set(register_catalog) - set(read_observed_register_addresses)
+    )
+    summary["read_observed_register_addresses"] = read_observed_register_addresses
+    summary["read_observed_register_address_count"] = len(
+        read_observed_register_addresses
+    )
+    summary["missing_read_register_addresses"] = missing_read_register_addresses
+    summary["missing_read_register_address_labels"] = [
+        f"D{address}" for address in missing_read_register_addresses
+    ]
+
+    timestamp_missing_chunks = [
+        chunk for chunk in chunks if chunk.timestamp_ms is None
+    ]
+    idle_segments: list[dict[str, object]] = []
+    start_ms = capture_metadata.get("capture_start_timestamp_ms")
+    end_ms = capture_metadata.get("capture_end_timestamp_ms")
+    timestamped_chunks = [
+        chunk for chunk in chunks if chunk.timestamp_ms is not None
+    ]
+    if timestamped_chunks and isinstance(start_ms, int):
+        idle_segments.append(
+            {
+                "kind": "capture_start_to_first_chunk",
+                "seconds": max(
+                    0.0, (timestamped_chunks[0].timestamp_ms - start_ms) / 1000.0
+                ),
+                "before_sequence": None,
+                "after_sequence": timestamped_chunks[0].sequence,
+            }
+        )
+    for previous, current in zip(timestamped_chunks, timestamped_chunks[1:]):
+        idle_segments.append(
+            {
+                "kind": "between_chunks",
+                "seconds": max(
+                    0.0, (current.timestamp_ms - previous.timestamp_ms) / 1000.0
+                ),
+                "before_sequence": previous.sequence,
+                "after_sequence": current.sequence,
+            }
+        )
+    if timestamped_chunks and isinstance(end_ms, int):
+        idle_segments.append(
+            {
+                "kind": "last_chunk_to_capture_end",
+                "seconds": max(
+                    0.0, (end_ms - timestamped_chunks[-1].timestamp_ms) / 1000.0
+                ),
+                "before_sequence": timestamped_chunks[-1].sequence,
+                "after_sequence": None,
+            }
+        )
+    max_idle_segment = max(
+        idle_segments, key=lambda segment: float(segment["seconds"]), default=None
+    )
+    summary["chunk_timestamp_missing_count"] = len(timestamp_missing_chunks)
+    summary["max_uart_idle_seconds"] = (
+        float(max_idle_segment["seconds"]) if max_idle_segment else None
+    )
+    summary["max_uart_idle_segment"] = max_idle_segment
+    summary["max_uart_idle_limit_seconds"] = args.max_idle_seconds
+
+    frame_rows.sort(
+        key=lambda row: (
+            int(row.get("boot_id", 0)),
+            int(row.get("last_sequence", 0)),
+            str(row.get("source", "")),
+            int(row.get("first_sequence", 0)),
+        )
+    )
+
+    if args.frames_csv:
+        write_csv(
+            args.frames_csv,
+            frame_rows,
+            [
+                "source",
+                "boot_id",
+                "first_sequence",
+                "last_sequence",
+                "completion_timestamp_ms",
+                "completion_timestamp_iso8601",
+                "kind",
+                "operation",
+                "semantic_status",
+                "request_sequence",
+                "address",
+                "function",
+                "start_register",
+                "start_register_label",
+                "register_count",
+                "start_bit",
+                "start_bit_label",
+                "bit_count",
+                "write_start_register",
+                "write_register_count",
+                "and_mask",
+                "or_mask",
+                "exception_code",
+                "write_data_hex",
+                "write_response_data_hex",
+                "write_response_value_u16",
+                "write_response_value_s16",
+                "parse_issue_expected_length",
+                "parse_issue_dropped_byte_hex",
+                "crc_valid",
+                "frame_hex",
+            ],
+        )
+    if args.registers_csv:
+        write_csv(
+            args.registers_csv,
+            register_rows,
+            [
+                "operation",
+                "boot_id",
+                "request_sequence",
+                "response_sequence",
+                "write_response_timestamp_ms",
+                "write_response_timestamp_iso8601",
+                "write_response_value_u16",
+                "write_response_value_s16",
+                "readback_sequence",
+                "readback_timestamp_ms",
+                "readback_timestamp_iso8601",
+                "readback_raw_u16",
+                "readback_status",
+                "completion_timestamp_ms",
+                "completion_timestamp_iso8601",
+                "function",
+                "register",
+                "register_label",
+                "mapped_fields",
+                "mapping_status",
+                "raw_u16",
+                "raw_s16",
+            ],
+        )
+
+    summary_text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    if args.summary_json:
+        args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_json.write_text(summary_text, encoding="utf-8", newline="\n")
+        checksum_path = args.summary_json.with_name(args.summary_json.name + ".sha256")
+        checksum_path.write_text(
+            f"{hashlib.sha256(summary_text.encode()).hexdigest()}  "
+            f"{args.summary_json.resolve()}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+    print(summary_text, end="")
+    integrity_failed = (
+        bool(sequence_gaps)
+        or summary["boot_session_count"] != 1
+        or bool(pending)
+        or expired_requests != 0
+        or unpaired_responses != 0
+        or structurally_invalid_frames != 0
+        or bool(not_cataloged_register_addresses)
+        or bool(missing_read_register_addresses)
+        or summary["unsupported_semantic_frames"] != 0
+        or summary["unresolved_semantic_addresses"] != 0
+        or summary.get("capture_start_count") != 1
+        or summary.get("capture_end_count") != 1
+        or not summary.get("capture_complete", False)
+        or summary.get("git_dirty") is not False
+        or summary.get("firmware_sha256") in (None, "missing")
+        or int(summary.get("capture_planned_duration_seconds", 0))
+        < args.min_duration_seconds
+        or float(summary.get("capture_elapsed_seconds", 0))
+        < args.min_duration_seconds
+        or not chunks
+        or bool(timestamp_missing_chunks)
+        or max_idle_segment is None
+        or float(max_idle_segment["seconds"]) > args.max_idle_seconds
+        or any(
+            state.crc_errors != 0
+            or state.discarded_bytes != 0
+            or bool(state.data)
+            for state in states.values()
+        )
+    )
+    return 2 if args.strict and integrity_failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

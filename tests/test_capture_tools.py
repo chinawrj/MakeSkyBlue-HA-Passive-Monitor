@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+
+import csv
+import json
+import hashlib
+import subprocess
+import sys
+import unittest
+import yaml
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from tools.analyze_uart_capture import (
+    Frame,
+    StreamState,
+    Chunk,
+    feed,
+    frame_completion_order,
+    frame_semantic_status,
+    frame_structure_valid,
+    load_register_mapping,
+    modbus_crc,
+    parse_capture_metadata,
+    parse_chunks,
+    request_details,
+    response_matches,
+    sequence_integrity,
+    timestamp_iso8601,
+)
+from tools.generate_makeskyblue_passive import (
+    OBSERVED_REGISTERS,
+    UPDATE_INTERVAL_SECONDS,
+    generate_entities,
+    write_mapping,
+)
+from tools.verify_public_release import ABSOLUTE_USER_PATH, INLINE_SECRET
+
+
+class ParseChunkTests(unittest.TestCase):
+    @staticmethod
+    def _run_strict_fixture(
+        directory: Path,
+        catalog_addresses: tuple[int, ...],
+        end_timestamp: str = "2026-08-08T00:00:01+08:00",
+        duration_seconds: int = 1,
+        max_idle_seconds: int = 10,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        mapping = directory / "mapping.csv"
+        mapping.write_text(
+            "register,register_label,status,mapped_fields,evidence\n"
+            + "".join(
+                f"{address},D{address},confirmed_semantic,field_{address},test\n"
+                for address in catalog_addresses
+            ),
+            encoding="utf-8",
+        )
+        capture = directory / "capture.log"
+        capture.write_text(
+            "2026-08-08T00:00:00+08:00 CAPTURE_START device=x "
+            f"duration_seconds={duration_seconds} git_commit=abc git_dirty=false "
+            "config_sha256=aa firmware_sha256=bb\n"
+            "2026-08-08T00:00:00.100+08:00 boot=7 #1 G1/GPIO1 8B "
+            "RAW_HEX=01.03.00.00.00.01.84.0A\n"
+            "2026-08-08T00:00:00.200+08:00 boot=7 #2 G2/GPIO2 7B "
+            "RAW_HEX=01.03.02.00.01.79.84\n"
+            f"{end_timestamp} CAPTURE_END reason=duration_complete\n",
+            encoding="utf-8",
+        )
+        tool = Path(__file__).resolve().parent.parent / "tools" / "analyze_uart_capture.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(tool),
+                "--strict",
+                "--mapping-csv",
+                str(mapping),
+                "--min-duration-seconds",
+                str(duration_seconds),
+                "--max-idle-seconds",
+                str(max_idle_seconds),
+                "--summary-json",
+                str(directory / "summary.json"),
+                str(capture),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        summary = json.loads(result.stdout)
+        assert (directory / "summary.json").read_text(encoding="utf-8") == result.stdout
+        checksum = (directory / "summary.json.sha256").read_text(encoding="utf-8")
+        assert checksum == (
+            f"{hashlib.sha256(result.stdout.encode()).hexdigest()}  "
+            f"{(directory / 'summary.json').resolve()}\n"
+        )
+        assert summary["capture_path"] == str(capture.resolve())
+        assert len(summary["capture_sha256"]) == 64
+        return result, summary
+
+    def test_short_chunk_without_repeated_length(self) -> None:
+        chunks = parse_chunks(
+            ["[D] monitor: #134 G1/GPIO1 1B RAW_HEX=01"]
+        )
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].sequence, 134)
+        self.assertEqual(chunks[0].data, b"\x01")
+
+    def test_public_release_secret_patterns_avoid_code_identifier_false_positives(self) -> None:
+        self.assertIsNone(INLINE_SECRET.search("capture_key: >-"))
+        self.assertIsNone(INLINE_SECRET.search("chunks_by_key: dict = {}"))
+        self.assertIsNone(INLINE_SECRET.search("key: !secret api_key"))
+        self.assertIsNone(INLINE_SECRET.search("password: !env_var CI_PASSWORD"))
+        self.assertIsNotNone(INLINE_SECRET.search('key: "actual-secret"'))
+        self.assertIsNotNone(INLINE_SECRET.search('wireguard_private_key: abc'))
+        self.assertIsNotNone(
+            ABSOLUTE_USER_PATH.search("/" + "Users/example/project")
+        )
+        self.assertIsNone(ABSOLUTE_USER_PATH.search("docs/project"))
+
+    def test_chunk_with_repeated_length(self) -> None:
+        chunks = parse_chunks(
+            ["[D] monitor: #135 G2/GPIO2 3B RAW_HEX=01.03.02 (3)"]
+        )
+        self.assertEqual(chunks[0].data, b"\x01\x03\x02")
+
+    def test_state_line_recovers_missing_raw_log_and_deduplicates(self) -> None:
+        chunks = parse_chunks(
+            [
+                "[S][text_sensor]: 'G1 Last UART Chunk' >> '#1729 8B 01030000003D841B'",
+                "[I][modbus_raw]: #1729 G1/GPIO1 8B RAW_HEX=01.03.00.00.00.3D.84.1B (8)",
+                "[S][text_sensor]: 'G2 Last UART Chunk' >> '#1730 3B 010302'",
+            ]
+        )
+        self.assertEqual([chunk.sequence for chunk in chunks], [1729, 1730])
+        self.assertEqual(chunks[1].data, b"\x01\x03\x02")
+
+    def test_boot_session_is_part_of_chunk_identity(self) -> None:
+        chunks = parse_chunks(
+            [
+                "2026-08-08T00:00:00+08:00 boot=11 #1 G1/GPIO1 1B RAW_HEX=01",
+                "2026-08-08T00:00:01+08:00 boot=22 #1 G1/GPIO1 1B RAW_HEX=02",
+            ]
+        )
+        self.assertEqual([(c.boot_id, c.sequence) for c in chunks], [(11, 1), (22, 1)])
+        self.assertLess(chunks[0].timestamp_ms, chunks[1].timestamp_ms)
+
+    def test_mismatched_length_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_chunks(["#136 G1/GPIO1 2B RAW_HEX=01"])
+
+    def test_crc_resynchronization_preserves_raw_context(self) -> None:
+        state = StreamState(role="request")
+        frames = feed(
+            state,
+            Chunk(
+                200,
+                1,
+                bytes.fromhex("0103000000010000"),
+                boot_id=9,
+                timestamp_ms=1786118400456,
+            ),
+        )
+        self.assertEqual(frames, [])
+        self.assertGreaterEqual(state.crc_errors, 1)
+        issue = state.issues[0]
+        self.assertEqual(issue.kind, "crc_error_resync")
+        self.assertEqual(issue.first_sequence, 200)
+        self.assertEqual(issue.last_sequence, 200)
+        self.assertEqual(issue.expected_length, 8)
+        self.assertEqual(issue.candidate_hex, "0103000000010000")
+        self.assertEqual(issue.dropped_byte_hex, "01")
+        self.assertEqual(issue.timestamp_ms, 1786118400456)
+
+    def test_d_register_mapping_keeps_raw_and_named_fields_distinct(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        mapping = load_register_mapping(
+            repo / "registers" / "makeskyblue-observed-registers.csv"
+        )
+        self.assertIn("grid_voltage_range", mapping[1])
+        self.assertIn("observed_raw_u16", mapping[24])
+        self.assertIn("load_power_factor", mapping[110])
+        self.assertIn("inverter_power_factor", mapping[110])
+        self.assertIn("pv_to_battery_max_charge_current_a", mapping[11])
+        self.assertIn("inverter_max_grid_current_a", mapping[12])
+        self.assertIn("observed_network_time_high_word", mapping[30])
+        self.assertIn("observed_network_time_low_word", mapping[31])
+
+    def test_wifi_module_startup_marker_is_not_crc_noise(self) -> None:
+        state = StreamState(role="request")
+        frames = feed(
+            state,
+            Chunk(477, 1, b"\x00\x00\x00\xff", timestamp_ms=1786118400123),
+        )
+        self.assertEqual(frames, [])
+        self.assertEqual(state.startup_markers, [(477, 477, 1786118400123)])
+        self.assertEqual(
+            timestamp_iso8601(1786118400123), "2026-08-07T16:00:00.123Z"
+        )
+        self.assertEqual(state.crc_errors, 0)
+        self.assertEqual(state.discarded_bytes, 0)
+
+    def test_strict_semantic_gate_classifies_unvalidated_function(self) -> None:
+        validated = Frame(1, 1, 1, bytes.fromhex("010300000001840A"))
+        unvalidated = Frame(1, 2, 2, bytes.fromhex("01050001FF00DDFA"))
+        self.assertEqual(frame_semantic_status(validated), "fully_parsed")
+        self.assertEqual(
+            frame_semantic_status(unvalidated), "unsupported_semantics"
+        )
+
+    def test_observed_fc06_pairs_by_d_address_and_preserves_both_values(self) -> None:
+        request = Frame(1, 1, 1, bytes.fromhex("0106000B0334F92F"))
+        response = Frame(2, 2, 2, bytes.fromhex("0106000B0000F808"))
+        self.assertTrue(frame_structure_valid(request))
+        self.assertTrue(frame_structure_valid(response))
+        self.assertEqual(frame_semantic_status(request), "fully_parsed")
+        self.assertEqual(frame_semantic_status(response), "fully_parsed")
+        self.assertTrue(response_matches(request, response))
+        details = request_details(request)
+        self.assertEqual(details["start_register_label"], "D11")
+        self.assertEqual(details["write_data_hex"], "0334")
+
+    def test_fc06_csv_records_first_readback_match_and_mismatch(self) -> None:
+        def with_crc(pdu: bytes) -> bytes:
+            crc = modbus_crc(pdu)
+            return pdu + bytes((crc & 0xFF, crc >> 8))
+
+        transactions = [
+            (1, with_crc(bytes.fromhex("0106000B0334"))),
+            (2, with_crc(bytes.fromhex("0106000B0000"))),
+            (1, with_crc(bytes.fromhex("0103000B0001"))),
+            (2, with_crc(bytes.fromhex("0103020334"))),
+            (1, with_crc(bytes.fromhex("0106000A026C"))),
+            (2, with_crc(bytes.fromhex("0106000A0000"))),
+            (1, with_crc(bytes.fromhex("0103000A0001"))),
+            (2, with_crc(bytes.fromhex("0103020258"))),
+        ]
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            capture = directory / "capture.log"
+            lines = []
+            for sequence, (source, payload) in enumerate(transactions, 1):
+                lines.append(
+                    f"2026-08-08T00:00:00.{sequence:03d}+08:00 boot=7 "
+                    f"#{sequence} G{source}/GPIO{source} {len(payload)}B "
+                    f"RAW_HEX={payload.hex('.').upper()}"
+                )
+            capture.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            registers = directory / "registers.csv"
+            tool = (
+                Path(__file__).resolve().parent.parent
+                / "tools"
+                / "analyze_uart_capture.py"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool),
+                    "--registers-csv",
+                    str(registers),
+                    str(capture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with registers.open(encoding="utf-8") as source:
+                write_rows = [
+                    row
+                    for row in csv.DictReader(source)
+                    if row["operation"] == "observed_write_register"
+                ]
+        self.assertEqual(len(write_rows), 2)
+        self.assertEqual(write_rows[0]["register_label"], "D11")
+        self.assertEqual(write_rows[0]["write_response_value_u16"], "0")
+        self.assertEqual(write_rows[0]["readback_raw_u16"], "820")
+        self.assertEqual(write_rows[0]["readback_status"], "match")
+        self.assertEqual(write_rows[1]["register_label"], "D10")
+        self.assertEqual(write_rows[1]["readback_raw_u16"], "600")
+        self.assertEqual(write_rows[1]["readback_status"], "mismatch")
+
+    def test_malformed_fc10_is_structurally_invalid(self) -> None:
+        malformed = Frame(
+            1, 1, 1, bytes.fromhex("0110001E000202AAAA5B75")
+        )
+        self.assertFalse(frame_structure_valid(malformed))
+        self.assertEqual(frame_semantic_status(malformed), "structurally_invalid")
+
+    def test_modbus_unicast_address_range_is_enforced(self) -> None:
+        valid_request = Frame(1, 1, 1, bytes.fromhex("F703000000010000"))
+        reserved_request = Frame(1, 2, 2, bytes.fromhex("F803000000010000"))
+        reserved_response = Frame(2, 3, 3, bytes.fromhex("FF030200010000"))
+        broadcast_write = Frame(
+            1, 4, 4, bytes.fromhex("0010001E000204112233440000")
+        )
+        self.assertTrue(frame_structure_valid(valid_request))
+        self.assertFalse(frame_structure_valid(reserved_request))
+        self.assertFalse(frame_structure_valid(reserved_response))
+        self.assertTrue(frame_structure_valid(broadcast_write))
+
+    def test_truncated_frames_are_structurally_invalid(self) -> None:
+        short_read_request = Frame(1, 1, 1, bytes.fromhex("0103"))
+        short_read_response = Frame(2, 2, 2, bytes.fromhex("0103"))
+        short_fc10_request = Frame(1, 3, 3, bytes.fromhex("01100000"))
+        self.assertFalse(frame_structure_valid(short_read_request))
+        self.assertFalse(frame_structure_valid(short_read_response))
+        self.assertFalse(frame_structure_valid(short_fc10_request))
+
+    def test_coil_address_is_not_labeled_as_d_register(self) -> None:
+        details = request_details(
+            Frame(1, 1, 1, bytes.fromhex("01050001FF00DDFA"))
+        )
+        self.assertEqual(details["start_bit_label"], "C1")
+        self.assertNotIn("start_register_label", details)
+
+    def test_capture_metadata_requires_clean_complete_session(self) -> None:
+        metadata = parse_capture_metadata(
+            [
+                "2026-08-08T00:00:00+08:00 CAPTURE_START device=x duration_seconds=86400 git_commit=abc git_dirty=false config_sha256=aa firmware_sha256=bb",
+                "2026-08-09T00:00:00+08:00 CAPTURE_END reason=duration_complete",
+            ]
+        )
+        self.assertTrue(metadata["capture_complete"])
+        self.assertEqual(metadata["capture_elapsed_seconds"], 86400)
+
+    def test_strict_requires_every_catalog_address_to_be_read(self) -> None:
+        with TemporaryDirectory() as directory:
+            result, summary = self._run_strict_fixture(
+                Path(directory), (0, 1)
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["missing_read_register_addresses"], [1])
+
+    def test_strict_rejects_fake_24h_metadata_without_uart_activity(self) -> None:
+        with TemporaryDirectory() as directory:
+            result, summary = self._run_strict_fixture(
+                Path(directory),
+                (0,),
+                end_timestamp="2026-08-09T00:00:00+08:00",
+                duration_seconds=86400,
+                max_idle_seconds=180,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertGreater(summary["max_uart_idle_seconds"], 86000)
+
+    def test_strict_accepts_complete_short_fixture_when_thresholds_are_lowered(self) -> None:
+        with TemporaryDirectory() as directory:
+            result, summary = self._run_strict_fixture(Path(directory), (0,))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(summary["read_observed_register_addresses"], [0])
+        self.assertEqual(summary["observed_modbus_slave_addresses"], [1])
+        self.assertEqual(summary["observed_modbus_slave_address_count"], 1)
+
+    def test_strict_accepts_all_178_addresses_when_all_are_confirmed(self) -> None:
+        def with_crc(pdu: bytes) -> bytes:
+            crc = modbus_crc(pdu)
+            return pdu + bytes((crc & 0xFF, crc >> 8))
+
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            mapping = directory / "mapping.csv"
+            mapping.write_text(
+                "register,register_label,status,mapped_fields,evidence\n"
+                + "".join(
+                    f"{address},D{address},confirmed_semantic,field_{address},test\n"
+                    for address in OBSERVED_REGISTERS
+                ),
+                encoding="utf-8",
+            )
+            lines = [
+                "2026-08-08T00:00:00+08:00 CAPTURE_START device=x "
+                "duration_seconds=1 git_commit=abc git_dirty=false "
+                "config_sha256=aa firmware_sha256=bb"
+            ]
+            sequence = 0
+            elapsed_tenths = 0
+            for start, count in ((0, 61), (100, 117)):
+                request = with_crc(
+                    bytes((1, 3, start >> 8, start & 0xFF, count >> 8, count & 0xFF))
+                )
+                response = with_crc(bytes((1, 3, count * 2)) + bytes(count * 2))
+                for source, payload in ((1, request), (2, response)):
+                    for offset in range(0, len(payload), 96):
+                        sequence += 1
+                        elapsed_tenths += 1
+                        chunk = payload[offset : offset + 96]
+                        lines.append(
+                            "2026-08-08T00:00:00."
+                            f"{elapsed_tenths:03d}+08:00 boot=7 #{sequence} "
+                            f"G{source}/GPIO{source} {len(chunk)}B "
+                            f"RAW_HEX={chunk.hex('.').upper()}"
+                        )
+            lines.append(
+                "2026-08-08T00:00:01+08:00 CAPTURE_END reason=duration_complete"
+            )
+            capture = directory / "capture.log"
+            capture.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tool = (
+                Path(__file__).resolve().parent.parent
+                / "tools"
+                / "analyze_uart_capture.py"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool),
+                    "--strict",
+                    "--mapping-csv",
+                    str(mapping),
+                    "--min-duration-seconds",
+                    "1",
+                    "--max-idle-seconds",
+                    "10",
+                    str(capture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            summary = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(summary["read_observed_register_address_count"], 178)
+        self.assertEqual(summary["missing_read_register_addresses"], [])
+        self.assertEqual(summary["observed_modbus_slave_addresses"], [1])
+
+    def test_frames_sort_by_completion_not_first_chunk(self) -> None:
+        response = Frame(
+            source=2,
+            first_sequence=10,
+            last_sequence=13,
+            data=b"\x01\x03\x02\x00\x01\x79\x84",
+        )
+        request = Frame(
+            source=1,
+            first_sequence=11,
+            last_sequence=11,
+            data=b"\x01\x03\x00\x00\x00\x01\x84\x0a",
+        )
+        ordered = sorted([response, request], key=frame_completion_order)
+        self.assertEqual(ordered, [request, response])
+
+    def test_sequence_integrity_separates_missing_from_log_reordering(self) -> None:
+        complete_but_reordered = [
+            Chunk(1, 1, b"a", boot_id=7, order=0),
+            Chunk(3, 2, b"b", boot_id=7, order=1),
+            Chunk(2, 1, b"c", boot_id=7, order=2),
+            Chunk(4, 2, b"d", boot_id=7, order=3),
+        ]
+        gaps, out_of_order = sequence_integrity(complete_but_reordered)
+        self.assertEqual(gaps, [])
+        self.assertEqual(len(out_of_order), 1)
+        self.assertEqual(out_of_order[0]["after"], 3)
+        self.assertEqual(out_of_order[0]["before"], 2)
+
+        missing_and_reordered = [
+            Chunk(1, 1, b"a", boot_id=9, order=0),
+            Chunk(4, 2, b"b", boot_id=9, order=1),
+            Chunk(2, 1, b"c", boot_id=9, order=2),
+            Chunk(5, 2, b"d", boot_id=9, order=3),
+        ]
+        gaps, out_of_order = sequence_integrity(missing_and_reordered)
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["expected"], 3)
+        self.assertEqual(gaps[0]["missing_count"], 1)
+        self.assertEqual(len(out_of_order), 1)
+
+    def test_strict_accepts_complete_capture_with_only_log_reordering(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            mapping = directory / "mapping.csv"
+            mapping.write_text(
+                "register,register_label,status,mapped_fields,evidence\n"
+                "0,D0,confirmed_semantic,field_0,test\n",
+                encoding="utf-8",
+            )
+            capture = directory / "capture.log"
+            capture.write_text(
+                "2026-08-08T00:00:00+08:00 CAPTURE_START device=x "
+                "duration_seconds=1 git_commit=abc git_dirty=false "
+                "config_sha256=aa firmware_sha256=bb\n"
+                "2026-08-08T00:00:00.100+08:00 boot=7 #1 G1/GPIO1 8B "
+                "RAW_HEX=01.03.00.00.00.01.84.0A\n"
+                "2026-08-08T00:00:00.150+08:00 boot=7 #3 G1/GPIO1 8B "
+                "RAW_HEX=01.03.00.00.00.01.84.0A\n"
+                "2026-08-08T00:00:00.200+08:00 boot=7 #2 G2/GPIO2 7B "
+                "RAW_HEX=01.03.02.00.01.79.84\n"
+                "2026-08-08T00:00:00.300+08:00 boot=7 #4 G2/GPIO2 7B "
+                "RAW_HEX=01.03.02.00.01.79.84\n"
+                "2026-08-08T00:00:01+08:00 CAPTURE_END "
+                "reason=duration_complete\n",
+                encoding="utf-8",
+            )
+            tool = (
+                Path(__file__).resolve().parent.parent
+                / "tools"
+                / "analyze_uart_capture.py"
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool),
+                    "--strict",
+                    "--mapping-csv",
+                    str(mapping),
+                    "--min-duration-seconds",
+                    "1",
+                    "--max-idle-seconds",
+                    "10",
+                    str(capture),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            summary = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(summary["sequence_gap_count"], 0)
+        self.assertEqual(summary["missing_sequence_count"], 0)
+        self.assertEqual(summary["sequence_out_of_order_count"], 1)
+        self.assertEqual(summary["pending_requests"], 0)
+        self.assertEqual(summary["unpaired_responses"], 0)
+
+    def test_clean_room_generator_covers_every_observed_d_register(self) -> None:
+        rendered = generate_entities()
+        # Packed words and multi-word values expose every decoded subfield;
+        # the stable address catalog therefore produces more than 178 entities.
+        self.assertEqual(rendered.count("  - platform: template"), 195)
+        for address in (1, 2, 11, 12, 24, 30, 31, 216):
+            self.assertIn(f'name: "D{address} ', rendered)
+        self.assertEqual(len(OBSERVED_REGISTERS), 178)
+        interval_counts = {
+            interval: rendered.count(f"    update_interval: {interval}s")
+            for interval in UPDATE_INTERVAL_SECONDS
+        }
+        self.assertEqual(sum(interval_counts.values()), 195)
+        self.assertLessEqual(max(interval_counts.values()), 27)
+        self.assertIn('name: "D110 load_power_factor"', rendered)
+        self.assertIn('name: "D110 inverter_power_factor"', rendered)
+        self.assertIn('name: "D132-D133 total_generated_energy_kwh"', rendered)
+        self.assertIn('name: "D32 force_charge_interval_days"', rendered)
+        self.assertIn('name: "D34 force_discharge_interval_days"', rendered)
+        self.assertIn('name: "D145 firmware_version"', rendered)
+
+    def test_generated_mapping_csv_matches_entities(self) -> None:
+        with TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "mapping.csv"
+            write_mapping(mapping_path)
+            mapping = load_register_mapping(mapping_path)
+        self.assertEqual(set(mapping), set(OBSERVED_REGISTERS))
+        self.assertEqual(mapping[24], ["observed_raw_u16"])
+        self.assertEqual(mapping[12], ["inverter_max_grid_current_a"])
+        self.assertEqual(
+            mapping[110], ["load_power_factor", "inverter_power_factor"]
+        )
+        self.assertEqual(
+            mapping[145], ["firmware_version_packed", "firmware_version"]
+        )
+        self.assertEqual(
+            mapping[132],
+            ["total_generated_energy_high_word", "total_generated_energy_kwh"],
+        )
+        self.assertIn("force_charge_start_hour", mapping[32])
+        self.assertIn("force_charge_start_time", mapping[32])
+        self.assertEqual(
+            mapping[30], ["observed_network_time_high_word"]
+        )
+
+    def test_ha_package_persists_before_ack(self) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        package = yaml.safe_load(
+            (repo / "home-assistant" / "makeskyblue_uart_capture.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        actions = package["automation"][0]["actions"]
+        persist_actions = actions[0]["then"]
+        self.assertEqual(persist_actions[0]["action"], "notify.send_message")
+        self.assertEqual(persist_actions[1]["action"], "input_text.set_value")
+        self.assertEqual(
+            actions[1]["action"],
+            "esphome.makeskybluemodbusmonitor_ack_uart_capture",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

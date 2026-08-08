@@ -1,0 +1,18 @@
+# Copy to wifi.local.yaml. Keep wifi.local.yaml and secrets.yaml untracked.
+networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+    priority: 3
+  - ssid: !secret wifi_ssid_backup1
+    password: !secret wifi_password_backup1
+    priority: 2
+  - ssid: !secret wifi_ssid_backup2
+    password: !secret wifi_password_backup2
+    priority: 1
+
+power_save_mode: none
+reboot_timeout: 0s
+
+ap:
+  ssid: "MakeSkyBlue Monitor Fallback"
+  password: !secret fallback_ap_password

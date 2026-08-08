@@ -1,0 +1,179 @@
+register,register_label,status,mapped_fields,evidence
+0,D0,confirmed_semantic,work_mode,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+1,D1,confirmed_semantic,grid_voltage_range,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+2,D2,confirmed_semantic,charging_priority,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+3,D3,confirmed_semantic,ac_frequency_setting,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+4,D4,confirmed_semantic,power_saving_mode,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+5,D5,confirmed_semantic,inverter_ac_voltage_level,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+6,D6,confirmed_semantic,battery_type,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+7,D7,confirmed_semantic,battery_rated_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+8,D8,confirmed_semantic,battery_discharge_min_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+9,D9,confirmed_semantic,battery_discharge_start_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+10,D10,confirmed_semantic,grid_to_battery_max_charge_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; FC06 request/readback mismatch also observed
+11,D11,confirmed_semantic,pv_to_battery_max_charge_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; FC06 changed raw 800 to 820 and FC03 read back 820
+12,D12,confirmed_semantic,inverter_max_grid_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+13,D13,confirmed_semantic,inverter_max_output_power_kw,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+14,D14,confirmed_semantic,charging_soc_pct,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+15,D15,confirmed_semantic,discharging_soc_pct,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+16,D16,confirmed_semantic,anti_reverse_mode,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+17,D17,confirmed_semantic,system_power_state,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+18,D18,observed_raw,observed_raw_u16,"local FC03 response capture; user-provided register preview suggests communication_address, but D18 remained raw 0 while every observed CRC-valid RTU frame used slave address 1; encoding is unresolved"
+19,D19,provisional_semantic,reset_energy_counter,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+20,D20,provisional_semantic,force_charge_discharge_control,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+21,D21,provisional_semantic,remote_anti_reverse,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+22,D22,confirmed_semantic,anti_reverse_power_w,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+23,D23,confirmed_semantic,battery_cutoff_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+24,D24,observed_raw,observed_raw_u16,local FC03 response capture
+25,D25,observed_raw,observed_raw_u16,local FC03 response capture
+26,D26,observed_raw,observed_raw_u16,local FC03 response capture
+27,D27,observed_raw,observed_raw_u16,local FC03 response capture
+28,D28,observed_raw,observed_raw_u16,local FC03 response capture
+29,D29,observed_raw,observed_raw_u16,local FC03 response capture
+30,D30,confirmed_semantic,observed_network_time_high_word,local FC10 captures plus decoded wall-clock agreement
+31,D31,confirmed_semantic,observed_network_time_low_word,local FC10 captures plus decoded wall-clock agreement
+32,D32,confirmed_semantic,force_charge_start_packed|force_charge_start_hour|force_charge_start_minute|force_charge_interval_days|force_charge_start_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+33,D33,confirmed_semantic,force_charge_end_packed|force_charge_end_hour|force_charge_end_minute|force_charge_end_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+34,D34,confirmed_semantic,force_discharge_start_packed|force_discharge_start_hour|force_discharge_start_minute|force_discharge_interval_days|force_discharge_start_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+35,D35,confirmed_semantic,force_discharge_end_packed|force_discharge_end_hour|force_discharge_end_minute|force_discharge_end_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+36,D36,confirmed_semantic,force_charge_discharge_status,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+37,D37,observed_raw,observed_raw_u16,local FC03 response capture
+38,D38,observed_raw,observed_raw_u16,local FC03 response capture
+39,D39,observed_raw,observed_raw_u16,local FC03 response capture
+40,D40,observed_raw,observed_raw_u16,local FC03 response capture
+41,D41,observed_raw,observed_raw_u16,local FC03 response capture
+42,D42,observed_raw,observed_raw_u16,local FC03 response capture
+43,D43,observed_raw,observed_raw_u16,local FC03 response capture
+44,D44,observed_raw,observed_raw_u16,local FC03 response capture
+45,D45,observed_raw,observed_raw_u16,local FC03 response capture
+46,D46,observed_raw,observed_raw_u16,local FC03 response capture
+47,D47,observed_raw,observed_raw_u16,local FC03 response capture
+48,D48,observed_raw,observed_raw_u16,local FC03 response capture
+49,D49,observed_raw,observed_raw_u16,local FC03 response capture
+50,D50,observed_raw,observed_raw_u16,local FC03 response capture
+51,D51,observed_raw,observed_raw_u16,local FC03 response capture
+52,D52,observed_raw,observed_raw_u16,local FC03 response capture
+53,D53,observed_raw,observed_raw_u16,local FC03 response capture
+54,D54,observed_raw,observed_raw_u16,local FC03 response capture
+55,D55,observed_raw,observed_raw_u16,local FC03 response capture
+56,D56,observed_raw,observed_raw_u16,local FC03 response capture
+57,D57,observed_raw,observed_raw_u16,local FC03 response capture
+58,D58,observed_raw,observed_raw_u16,local FC03 response capture
+59,D59,observed_raw,observed_raw_u16,local FC03 response capture
+60,D60,observed_raw,observed_raw_u16,local FC03 response capture
+100,D100,confirmed_semantic,system_type_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+101,D101,confirmed_semantic,inverter_status_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+102,D102,confirmed_semantic,mppt_status_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+103,D103,confirmed_semantic,busbar_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+104,D104,confirmed_semantic,grid_frequency_hz,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+105,D105,confirmed_semantic,grid_voltage_v,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+106,D106,confirmed_semantic,inverter_output_voltage_v,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+107,D107,confirmed_semantic,inverter_off_grid_load_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+108,D108,confirmed_semantic,inverter_grid_load_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+109,D109,confirmed_semantic,inverter_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+110,D110,confirmed_semantic,load_power_factor|inverter_power_factor,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; IoTRix UI low-byte split; timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; IoTRix UI high-byte split
+111,D111,confirmed_semantic,grid_power_w,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+112,D112,confirmed_semantic,load_power_w,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+113,D113,confirmed_semantic,inverter_real_power_w,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+114,D114,confirmed_semantic,battery_voltage_v,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+115,D115,confirmed_semantic,battery_charging_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+116,D116,observed_raw,observed_raw_u16,local FC03 response capture
+117,D117,observed_raw,observed_raw_u16,local FC03 response capture
+118,D118,observed_raw,observed_raw_u16,local FC03 response capture
+119,D119,observed_raw,observed_raw_u16,local FC03 response capture
+120,D120,observed_raw,observed_raw_u16,local FC03 response capture
+121,D121,observed_raw,observed_raw_u16,local FC03 response capture
+122,D122,confirmed_semantic,pv1_voltage_v,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+123,D123,confirmed_semantic,pv2_voltage_v,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+124,D124,provisional_semantic,pv3_voltage_v,three-channel register layout; IoTRix UI does not expose PV3
+125,D125,confirmed_semantic,pv1_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+126,D126,confirmed_semantic,pv2_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+127,D127,provisional_semantic,pv3_current_a,three-channel register layout; IoTRix UI does not expose PV3
+128,D128,confirmed_semantic,pv1_power_w,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+129,D129,confirmed_semantic,pv2_power_w,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+130,D130,provisional_semantic,pv3_power_w,three-channel register layout; IoTRix UI does not expose PV3
+131,D131,observed_raw,observed_raw_u16,"local FC03 response capture; D131 remained raw 84 throughout a sanitized seven-snapshot 90-second IoTRix comparison, but did not match the displayed daily energy 18.6, SOC 81, or another exposed cloud field under the tested integer/scaled transforms"
+132,D132,confirmed_semantic,total_generated_energy_high_word|total_generated_energy_kwh,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; coherent D132-D133 UINT32
+133,D133,confirmed_semantic,total_generated_energy_low_word,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+134,D134,confirmed_semantic,system_error_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+135,D135,provisional_semantic,dc_temperature_c,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; equal-temperature samples do not disambiguate D135/D137/D138
+136,D136,confirmed_semantic,inverter_temperature_c,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+137,D137,provisional_semantic,mppt1_temperature_c,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; equal-temperature samples do not disambiguate D135/D137/D138
+138,D138,provisional_semantic,mppt2_temperature_c,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08; equal-temperature samples do not disambiguate D135/D137/D138
+139,D139,provisional_semantic,mppt3_temperature_c,three-channel register layout; IoTRix UI does not expose MPPT3
+140,D140,confirmed_semantic,relay_status_code,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+141,D141,confirmed_semantic,solar_status_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+142,D142,confirmed_semantic,battery_status_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+143,D143,confirmed_semantic,grid_status_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+144,D144,confirmed_semantic,load_status_code,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+145,D145,confirmed_semantic,firmware_version_packed|firmware_version,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+146,D146,observed_raw,observed_raw_u16,local FC03 response capture
+147,D147,observed_raw,observed_raw_u16,local FC03 response capture
+148,D148,observed_raw,observed_raw_u16,local FC03 response capture
+149,D149,observed_raw,observed_raw_u16,local FC03 response capture
+150,D150,observed_raw,observed_raw_u16,local FC03 response capture
+151,D151,observed_raw,observed_raw_u16,local FC03 response capture
+152,D152,observed_raw,observed_raw_u16,local FC03 response capture
+153,D153,observed_raw,observed_raw_u16,local FC03 response capture
+154,D154,observed_raw,observed_raw_u16,local FC03 response capture
+155,D155,observed_raw,observed_raw_u16,local FC03 response capture
+156,D156,observed_raw,observed_raw_u16,local FC03 response capture
+157,D157,observed_raw,observed_raw_u16,local FC03 response capture
+158,D158,observed_raw,observed_raw_u16,local FC03 response capture
+159,D159,observed_raw,observed_raw_u16,local FC03 response capture
+160,D160,observed_raw,observed_raw_u16,local FC03 response capture
+161,D161,observed_raw,observed_raw_u16,local FC03 response capture
+162,D162,observed_raw,observed_raw_u16,local FC03 response capture
+163,D163,observed_raw,observed_raw_u16,local FC03 response capture
+164,D164,observed_raw,observed_raw_u16,local FC03 response capture
+165,D165,observed_raw,observed_raw_u16,local FC03 response capture
+166,D166,observed_raw,observed_raw_u16,local FC03 response capture
+167,D167,observed_raw,observed_raw_u16,local FC03 response capture
+168,D168,observed_raw,observed_raw_u16,local FC03 response capture
+169,D169,observed_raw,observed_raw_u16,local FC03 response capture
+170,D170,observed_raw,observed_raw_u16,local FC03 response capture
+171,D171,observed_raw,observed_raw_u16,local FC03 response capture
+172,D172,observed_raw,observed_raw_u16,local FC03 response capture
+173,D173,observed_raw,observed_raw_u16,local FC03 response capture
+174,D174,observed_raw,observed_raw_u16,local FC03 response capture
+175,D175,observed_raw,observed_raw_u16,local FC03 response capture
+176,D176,observed_raw,observed_raw_u16,local FC03 response capture
+177,D177,observed_raw,observed_raw_u16,local FC03 response capture
+178,D178,observed_raw,observed_raw_u16,local FC03 response capture
+179,D179,observed_raw,observed_raw_u16,local FC03 response capture
+180,D180,observed_raw,observed_raw_u16,local FC03 response capture
+181,D181,observed_raw,observed_raw_u16,local FC03 response capture
+182,D182,observed_raw,observed_raw_u16,local FC03 response capture
+183,D183,observed_raw,observed_raw_u16,local FC03 response capture
+184,D184,observed_raw,observed_raw_u16,local FC03 response capture
+185,D185,observed_raw,observed_raw_u16,local FC03 response capture
+186,D186,observed_raw,observed_raw_u16,local FC03 response capture
+187,D187,observed_raw,observed_raw_u16,local FC03 response capture
+188,D188,observed_raw,observed_raw_u16,local FC03 response capture
+189,D189,observed_raw,observed_raw_u16,local FC03 response capture
+190,D190,observed_raw,observed_raw_u16,local FC03 response capture
+191,D191,observed_raw,observed_raw_u16,local FC03 response capture
+192,D192,observed_raw,observed_raw_u16,local FC03 response capture
+193,D193,observed_raw,observed_raw_u16,local FC03 response capture
+194,D194,observed_raw,observed_raw_u16,local FC03 response capture
+195,D195,observed_raw,observed_raw_u16,local FC03 response capture
+196,D196,observed_raw,observed_raw_u16,local FC03 response capture
+197,D197,observed_raw,observed_raw_u16,local FC03 response capture
+198,D198,observed_raw,observed_raw_u16,local FC03 response capture
+199,D199,observed_raw,observed_raw_u16,local FC03 response capture
+200,D200,observed_raw,observed_raw_u16,local FC03 response capture
+201,D201,confirmed_semantic,charging_limit_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+202,D202,confirmed_semantic,charging_limit_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+203,D203,confirmed_semantic,discharging_limit_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+204,D204,confirmed_semantic,discharging_limit_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+205,D205,confirmed_semantic,battery_sum_voltage_v,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+206,D206,confirmed_semantic,battery_sum_current_a,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+207,D207,provisional_semantic,battery_max_temperature_c,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+208,D208,confirmed_semantic,battery_soc_pct,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+209,D209,confirmed_semantic,battery_soh_pct,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+210,D210,provisional_semantic,battery_remaining_capacity,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+211,D211,provisional_semantic,battery_full_capacity,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+212,D212,provisional_semantic,battery_rated_capacity,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+213,D213,provisional_semantic,battery_cycle_count,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; address meaning not yet changed under control
+214,D214,provisional_semantic,warning_status_flags,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+215,D215,provisional_semantic,protection_status_flags,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08
+216,D216,provisional_semantic,error_status_flags,timestamped local UART/IoTRix 2.2.31 live-data cross-checks including a sanitized seven-snapshot 90-second window on 2026-08-08

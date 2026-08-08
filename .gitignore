@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+.esphome/
+build/
+/secrets.yaml
+wifi.local.yaml
+wireguard.local.yaml
+firmware-backups/
+captures/
+reports/
+tmp/
+*.log
+*.csv
+!registers/*.csv
+.DS_Store
+
+# Local research/probe artifacts are intentionally excluded from the passive
+# public release. Several can transmit and must never be staged accidentally.
+/components/uart_echo_filter/
+/docs/field-validation.md
+/docs/old-firmware-backup.md
+/docs/protocol-analysis.md
+/docs/stage-1-validation.md
+/make-sky-blue*.yaml
+/makeskyblue-loopback-*.yaml
+/packages/atoms3-uart-loopback-test.yaml
+/packages/makeskyblue-readonly.yaml
+/references/solar_manager/
+/tools/generate_makeskyblue_readonly.py

@@ -1,0 +1,47 @@
+# Home Assistant package for the AtomS3 UART capture event drain.
+#
+# Prerequisites:
+#   1. Add the ESPHome device and enable Home Assistant actions.
+#   2. Add a File integration entity named notify.modbus_uart_log.
+#   3. Create /config/modbus_uart_capture.csv with the header documented in
+#      docs/atoms3-g1-g2-modbus-monitor.md.
+
+input_text:
+  makeskyblue_uart_last_persisted_key:
+    name: MakeSkyBlue UART last appended key
+    max: 32
+
+automation:
+  - alias: Record MakeSkyBlue Modbus UART
+    id: record_makeskyblue_modbus_uart
+    triggers:
+      - trigger: event
+        event_type: esphome.modbus_uart_capture
+        event_data:
+          device: makeskybluemodbusmonitor
+    variables:
+      capture_key: >-
+        {{ trigger.event.data.boot_id | string }}:{{ trigger.event.data.sequence | string }}
+    actions:
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.makeskyblue_uart_last_persisted_key') != capture_key }}
+        then:
+          - action: notify.send_message
+            target:
+              entity_id: notify.modbus_uart_log
+            data:
+              message: >-
+                {{ trigger.event.time_fired.isoformat() }},{{ trigger.event.data.boot_id }},{{ trigger.event.data.record_type }},{{ trigger.event.data.sequence }},{{ trigger.event.data.uptime_ms }},{{ trigger.event.data.source }},{{ trigger.event.data.gpio }},{{ trigger.event.data.byte_count }},{{ trigger.event.data.overwritten_total }},{{ trigger.event.data.buffer_remaining }},{{ trigger.event.data.message | default('') | replace(',', ';') }},{{ trigger.event.data.hex }}
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.makeskyblue_uart_last_persisted_key
+            data:
+              value: "{{ capture_key }}"
+      - action: esphome.makeskybluemodbusmonitor_ack_uart_capture
+        data:
+          boot_id: "{{ trigger.event.data.boot_id | string }}"
+          sequence: "{{ trigger.event.data.sequence | string }}"
+    mode: queued
+    max: 1000

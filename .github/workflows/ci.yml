@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned ESPHome
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python tools
+        run: python -m py_compile tools/*.py
+      - name: Check generated register artifacts
+        run: |
+          python tools/generate_makeskyblue_passive.py \
+            --output /tmp/makeskyblue-passive-entities.yaml \
+            --mapping-output /tmp/makeskyblue-observed-registers.csv
+          cmp packages/makeskyblue-passive-entities.yaml \
+            /tmp/makeskyblue-passive-entities.yaml
+          cmp registers/makeskyblue-observed-registers.csv \
+            /tmp/makeskyblue-observed-registers.csv
+      - name: Test passive parser
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -I. \
+            tests/passive_modbus_monitor_test.cpp -o /tmp/passive_monitor_test
+          /tmp/passive_monitor_test
+      - name: Test UART ring
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -I. \
+            tests/uart_capture_ring_test.cpp -o /tmp/uart_capture_ring_test
+          /tmp/uart_capture_ring_test
+      - name: Test capture tools
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Verify public release boundary
+        run: |
+          python tools/verify_public_release.py
+          git show --check --oneline --no-renames HEAD
+      - name: Validate and compile portable ESPHome configuration
+        run: |
+          cp tests/ci/secrets.yaml secrets.yaml
+          cp wifi.example.yaml wifi.local.yaml
+          cp wireguard.example.yaml wireguard.local.yaml
+          export CI_WIFI_SSID=ci-network
+          export CI_WIFI_PASSWORD=ci-test-password
+          export CI_WIFI_SSID_BACKUP1=ci-network-backup-1
+          export CI_WIFI_PASSWORD_BACKUP1=ci-test-password-1
+          export CI_WIFI_SSID_BACKUP2=ci-network-backup-2
+          export CI_WIFI_PASSWORD_BACKUP2=ci-test-password-2
+          export CI_API_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+          export CI_OTA_PASSWORD=ci-test-ota-password
+          export CI_FALLBACK_AP_PASSWORD=ci-test-fallback-password
+          export CI_WIREGUARD_PRIVATE_KEY="$(openssl rand -base64 32)"
+          export CI_WIREGUARD_ENDPOINT=vpn.example.invalid
+          export CI_WIREGUARD_PEER_PUBLIC_KEY="$(openssl rand -base64 32)"
+          export CI_WIREGUARD_PRESHARED_KEY="$(openssl rand -base64 32)"
+          esphome config makeskyblue-modbus-monitor.yaml
+          esphome compile makeskyblue-modbus-monitor.yaml
+      - name: Enforce generated RX-only UART boundary
+        run: |
+          generated=.esphome/build/makeskybluemodbusmonitor/src/main.cpp
+          test "$(rg -c 'set_rx_pin' "$generated")" -eq 2
+          test "$(rg -c 'FLAG_INPUT' "$generated")" -eq 2
+          rg -q 'GPIO_NUM_1' "$generated"
+          rg -q 'GPIO_NUM_2' "$generated"
+          ! rg -n 'set_tx_pin|uart_write|write_array|\.write\(' "$generated"
