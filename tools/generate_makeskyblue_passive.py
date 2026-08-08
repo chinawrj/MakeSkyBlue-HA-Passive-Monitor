@@ -42,6 +42,12 @@ LIVE_SETTINGS = (
     "on 2026-08-08"
 )
 PROVISIONAL_SETTINGS = LIVE_SETTINGS + "; address meaning not yet changed under control"
+D36_FORCE_CHARGE_EVIDENCE = (
+    "controlled local FC06/readback plus user-provided IoTRix settings "
+    "screenshot on 2026-08-08: D36 stayed raw 0 before enabling the force-charge "
+    "schedule, changed to raw 1, and remained 1 while force charge was on, "
+    "22:00-08:00, with force discharge off; only bit 0 is confirmed"
+)
 RAW_EVIDENCE = {
     18: (
         "local FC03 response capture; user-provided register preview suggests "
@@ -258,8 +264,18 @@ FIELD_SPECS: dict[int, tuple[FieldSpec, ...]] = {
             expression="(passive_modbus::monitor.raw_u16(35) >> 5U) & 0x3FU",
         ),
     ),
-    36: field(
-        "force_charge_discharge_status", "confirmed_semantic", LIVE_SETTINGS
+    36: (
+        FieldSpec(
+            "force_charge_discharge_status",
+            "confirmed_semantic",
+            D36_FORCE_CHARGE_EVIDENCE,
+        ),
+        FieldSpec(
+            "force_charge_schedule_enabled_bit0",
+            "confirmed_semantic",
+            D36_FORCE_CHARGE_EVIDENCE,
+            expression="passive_modbus::monitor.raw_u16(36) & 0x0001U",
+        ),
     ),
     100: field("system_type_code", "confirmed_semantic", LIVE_DATA),
     101: field("inverter_status_code", "confirmed_semantic", LIVE_DATA),

@@ -35,7 +35,7 @@ register,register_label,status,mapped_fields,evidence
 33,D33,confirmed_semantic,force_charge_end_packed|force_charge_end_hour|force_charge_end_minute|force_charge_end_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
 34,D34,confirmed_semantic,force_discharge_start_packed|force_discharge_start_hour|force_discharge_start_minute|force_discharge_interval_days|force_discharge_start_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
 35,D35,confirmed_semantic,force_discharge_end_packed|force_discharge_end_hour|force_discharge_end_minute|force_discharge_end_time,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
-36,D36,confirmed_semantic,force_charge_discharge_status,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
+36,D36,confirmed_semantic,force_charge_discharge_status|force_charge_schedule_enabled_bit0,"controlled local FC06/readback plus user-provided IoTRix settings screenshot on 2026-08-08: D36 stayed raw 0 before enabling the force-charge schedule, changed to raw 1, and remained 1 while force charge was on, 22:00-08:00, with force discharge off; only bit 0 is confirmed"
 37,D37,observed_raw,observed_raw_u16,local FC03 response capture
 38,D38,observed_raw,observed_raw_u16,local FC03 response capture
 39,D39,observed_raw,observed_raw_u16,local FC03 response capture

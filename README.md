@@ -5,7 +5,7 @@ the 3.3 V TTL UART between a MakeSkyBlue Wi-Fi module and its inverter. It
 reassembles and validates Modbus RTU frames, pairs requests with responses,
 caches observed registers, and publishes decoded values to Home Assistant.
 
-Version documented here: `v0.1.0-alpha.7`. This is the current parsing and HA
+Version documented here: `v0.1.0-alpha.8`. This is the current parsing and HA
 sensor candidate. It is not yet the final 24-hour, zero-unknown validation
 build.
 
@@ -30,7 +30,7 @@ it will not be hidden behind a boolean TX substitution. See
 for the captured request schedule, naming, hardware interlocks and cutover
 checklist. No direct/TX role is shipped in this release.
 
-Alpha.7 retains the alpha.6 no-transmit preview of that transition. Both pins remain RX and
+Alpha.8 retains the alpha.6 no-transmit preview of that transition. Both pins remain RX and
 the firmware pairs observed FC03 requests/responses to auto-detect the future
 TX-candidate and RX pins. HA exposes a one-way
 `PREVIEW Arm Direct Mode Permanently` switch. After it is armed, both UART
@@ -72,6 +72,10 @@ change or additional live correlation confirms them. All remaining words stay
 explicit raw values.
 For example, HA and the CSV use `D11 pv_to_battery_max_charge_current_a`,
 `D12 inverter_max_grid_current_a`, and `D24 observed_raw_u16`.
+The controlled force-charge-plan transition is exposed as
+`D36 force_charge_schedule_enabled_bit0`; the complete D36 raw status word is
+retained separately because no force-discharge bit has yet been changed under
+control.
 `D18` remains raw: a local preview calls it a communication-address setting,
 but its captured value is consistently 0 while the actual RTU frame address is
 1, so the firmware reports the wire address directly instead of guessing an

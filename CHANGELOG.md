@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-alpha.8 - 2026-08-08
+
+- Correlate a user-confirmed IoTRix “enable force-charge schedule” action with
+  the passive FC06 request for Modbus D36 raw 1, its device-specific response
+  word 0, and the first plus subsequent FC03 readbacks of D36 raw 1.
+- Record the preceding D36 raw 0 state and the sanitized UI facts: force charge
+  enabled for 22:00-08:00, interval zero days, while force discharge remained
+  disabled.
+- Expose `D36 force_charge_schedule_enabled_bit0` as a named HA diagnostic
+  while retaining the complete D36 status word and explicitly leaving every
+  untested force-discharge bit/value unresolved.
+- Keep GPIO1/GPIO2 floating RX-only. This release adds no TX pin, UART write,
+  active Modbus component, OTA operation, or copied application asset.
+
 ## 0.1.0-alpha.7 - 2026-08-08
 
 - Record the controlled IoTRix/panel d13=70 operation as clean-room evidence:

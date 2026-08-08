@@ -524,7 +524,7 @@ class ParseChunkTests(unittest.TestCase):
         rendered = generate_entities()
         # Packed words and multi-word values expose every decoded subfield;
         # the stable address catalog therefore produces more than 178 entities.
-        self.assertEqual(rendered.count("  - platform: template"), 195)
+        self.assertEqual(rendered.count("  - platform: template"), 196)
         for address in (1, 2, 11, 12, 24, 30, 31, 216):
             self.assertIn(f'name: "D{address} ', rendered)
         self.assertEqual(len(OBSERVED_REGISTERS), 178)
@@ -532,13 +532,19 @@ class ParseChunkTests(unittest.TestCase):
             interval: rendered.count(f"    update_interval: {interval}s")
             for interval in UPDATE_INTERVAL_SECONDS
         }
-        self.assertEqual(sum(interval_counts.values()), 195)
+        self.assertEqual(sum(interval_counts.values()), 196)
         self.assertLessEqual(max(interval_counts.values()), 27)
         self.assertIn('name: "D110 load_power_factor"', rendered)
         self.assertIn('name: "D110 inverter_power_factor"', rendered)
         self.assertIn('name: "D132-D133 total_generated_energy_kwh"', rendered)
         self.assertIn('name: "D32 force_charge_interval_days"', rendered)
         self.assertIn('name: "D34 force_discharge_interval_days"', rendered)
+        self.assertIn(
+            'name: "D36 force_charge_schedule_enabled_bit0"', rendered
+        )
+        self.assertIn(
+            "passive_modbus::monitor.raw_u16(36) & 0x0001U", rendered
+        )
         self.assertIn('name: "D145 firmware_version"', rendered)
 
     def test_generated_mapping_csv_matches_entities(self) -> None:
@@ -561,6 +567,13 @@ class ParseChunkTests(unittest.TestCase):
         )
         self.assertIn("force_charge_start_hour", mapping[32])
         self.assertIn("force_charge_start_time", mapping[32])
+        self.assertEqual(
+            mapping[36],
+            [
+                "force_charge_discharge_status",
+                "force_charge_schedule_enabled_bit0",
+            ],
+        )
         self.assertEqual(
             mapping[30], ["observed_network_time_high_word"]
         )

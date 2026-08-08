@@ -24,7 +24,7 @@ esphome:
   friendly_name: MakeSkyBlueModbusMonitor
   project:
     name: rjwang.makeskyblue_modbus_monitor
-    version: 0.1.0-alpha.7
+    version: 0.1.0-alpha.8
   includes:
     - components/uart_capture_ring.h
     - components/passive_modbus_monitor.h

@@ -487,6 +487,16 @@ sensor:
       return static_cast<float>(static_cast<float>(passive_modbus::monitor.raw_u16(36)));
 
   - platform: template
+    id: passive_msb_d36_force_charge_schedule_enabled_bit0
+    name: "D36 force_charge_schedule_enabled_bit0"
+    update_interval: 79s
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: |-
+      if (!passive_modbus::monitor.has_register(36)) return {};
+      return static_cast<float>(passive_modbus::monitor.raw_u16(36) & 0x0001U);
+
+  - platform: template
     id: passive_msb_d37_observed_raw_u16
     name: "D37 observed_raw_u16"
     update_interval: 83s
