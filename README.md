@@ -1,11 +1,11 @@
-# MakeSkyBlue passive UART monitor
+# MakeSkyBlue Local Link — passive UART monitor role
 
 ESPHome firmware for an M5Stack AtomS3 that passively observes both sides of
 the 3.3 V TTL UART between a MakeSkyBlue Wi-Fi module and its inverter. It
 reassembles and validates Modbus RTU frames, pairs requests with responses,
 caches observed registers, and publishes decoded values to Home Assistant.
 
-Version documented here: `v0.1.0-alpha.4`. This is the current parsing and HA
+Version documented here: `v0.1.0-alpha.5`. This is the current parsing and HA
 sensor candidate. It is not yet the final 24-hour, zero-unknown validation
 build.
 
@@ -21,6 +21,14 @@ build.
 
 Older active-probe experiments are intentionally excluded from the public
 repository and release archive. The published monitor is RX-only.
+
+The role-neutral entry point `makeskyblue-local-link.yaml` currently selects
+only this passive role. The planned replacement of the original Wi-Fi module
+will use a separate, explicitly active `direct_readonly_bridge` configuration;
+it will not be hidden behind a boolean TX substitution. See
+[`docs/direct-communication-module-transition.md`](docs/direct-communication-module-transition.md)
+for the captured request schedule, naming, hardware interlocks and cutover
+checklist. No direct/TX role is shipped in this release.
 
 ## What the alpha exposes
 
@@ -77,15 +85,15 @@ installation-specific absolute paths.
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/esphome compile makeskyblue-modbus-monitor.yaml
-.venv/bin/esphome upload makeskyblue-modbus-monitor.yaml \
+.venv/bin/esphome compile makeskyblue-local-link.yaml
+.venv/bin/esphome upload makeskyblue-local-link.yaml \
   --device makeskybluemodbusmonitor.local
 ```
 
 Follow raw UART output online, without USB:
 
 ```sh
-.venv/bin/esphome logs makeskyblue-modbus-monitor.yaml \
+.venv/bin/esphome logs makeskyblue-local-link.yaml \
   --device makeskybluemodbusmonitor.local
 ```
 

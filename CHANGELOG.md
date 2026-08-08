@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-alpha.5 - 2026-08-08
+
+- Fix the Ubuntu `-Werror=sign-compare` failure in the coherent UINT32 bounds
+  check without changing parser behavior.
+- Add the role-neutral `makeskyblue-local-link.yaml` entry point. It still
+  resolves exclusively to the strict passive RX-only monitor; no TX role is
+  shipped.
+- Document the planned transition to a physically isolated
+  `direct_readonly_bridge`, including project naming, GPIO role change,
+  hardware interlocks, the observed four-range FC03 schedule, timing baseline,
+  pre-cutover evidence checklist and explicit default ban on FC06/FC10 writes.
+- Validate the role-neutral entry in CI while retaining the generated-code
+  gate that requires exactly two RX pins and rejects every TX/UART-write path.
+
 ## 0.1.0-alpha.4 - 2026-08-08
 
 - Replace installation-specific absolute Wi-Fi and WireGuard include paths

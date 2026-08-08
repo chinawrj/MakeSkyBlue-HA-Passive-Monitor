@@ -1,0 +1,8 @@
+# Role-neutral build entry point.
+#
+# This release deliberately selects the strict passive RX-only role. It is the
+# only role shipped today. A future direct communication role must live in a
+# separate top-level YAML and may replace this include only after the original
+# Wi-Fi module is physically removed and that role has its own release.
+packages:
+  selected_role: !include makeskyblue-modbus-monitor.yaml

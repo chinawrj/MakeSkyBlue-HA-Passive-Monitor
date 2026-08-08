@@ -69,7 +69,8 @@ class PassiveModbusMonitor {
   }
 
   bool has_u32(uint16_t address) const {
-    return address + 1 < REGISTER_CAPACITY && this->has_register(address) &&
+    return static_cast<size_t>(address) + 1U < REGISTER_CAPACITY &&
+           this->has_register(address) &&
            this->has_register(address + 1) &&
            this->registers_[address].response_sequence ==
                this->registers_[address + 1].response_sequence;

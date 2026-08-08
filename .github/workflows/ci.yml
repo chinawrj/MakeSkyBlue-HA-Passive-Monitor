@@ -62,6 +62,7 @@ jobs:
           export CI_WIREGUARD_ENDPOINT=vpn.example.invalid
           export CI_WIREGUARD_PEER_PUBLIC_KEY="$(openssl rand -base64 32)"
           export CI_WIREGUARD_PRESHARED_KEY="$(openssl rand -base64 32)"
+          esphome config makeskyblue-local-link.yaml
           esphome config makeskyblue-modbus-monitor.yaml
           esphome compile makeskyblue-modbus-monitor.yaml
       - name: Enforce generated RX-only UART boundary
