@@ -13,10 +13,27 @@ AtomS3 才能从监听器变成主动通信模块。
 | 角色 | 建议名称 | 总线能力 | 当前状态 |
 | --- | --- | --- | --- |
 | `passive_monitor_rx_only` | Passive Monitor | G1/G2 仅接收 | 已实现、默认 |
-| `direct_readonly_bridge` | Direct Read-Only Bridge | G1 发送 FC03；G2 接收响应 | 尚未实现 |
+| `direct_mode_preview` | Direct Mode Preview | G1/G2 仍仅接收 | 已实现、无 TX |
+| `direct_readonly_bridge` | Direct Read-Only Bridge | 自动选择 TX；另一脚 RX | 尚未实现 |
 
 这里的 “Read-Only Bridge” 表示不写逆变器寄存器。它仍必须在物理线路上发送
 FC03 读请求，所以绝不能和“电气 RX-only”混为一谈。
+
+### 1.1 当前 preview 的 HA 配置
+
+alpha.6 提供 `PREVIEW Arm Direct Mode Permanently` 开关。它是单向锁存：开启后
+HA 不能关闭；只有整片擦除偏好存储才可清除。开关开启不会立即生效，两个 RX
+输入必须连续 30 秒没有任何字节，状态才从
+`armed_waiting_for_30s_uart_idle` 进入 `preview_ready_no_tx_compiled`。
+
+方向也不靠固定 G1/G2 假设：固件同时监听两脚，至少配对四组 CRC 正确的
+FC03/FC04 请求和响应，才把请求所在脚保存为未来 TX candidate、响应所在脚保存
+为未来 RX。HA 会显示 `Detected Future TX Pin`、`Detected Future RX Pin`、配对数
+和冲突票数。
+
+preview ready 仍不等于主动通信。该固件没有 `tx_pin` 和发送 API，所以无论开关、
+idle 或方向状态如何都不能输出 UART。只有操作者明确确认原 Wi-Fi 模块已物理拔除
+后，后续独立 release 才可加入实际 direct role。
 
 仓库现有名称保留被动监听阶段的证据血缘。角色中立入口是
 `makeskyblue-local-link.yaml`；目前它只能 include
@@ -100,6 +117,25 @@ Wi-Fi 模块按下列顺序循环发送 FC03：
 首版只发送上述四个 FC03 请求，不发送 FC06、FC10 或广播，也不提供 HA 写服务。
 不做 D30–D31 校时不会阻止读取遥测；如果以后确需校时或控制，必须另做受控实验、
 独立许可开关、独立 release 和读回验证。
+
+#### 4.2.1 已观测写入的线类型与证据边界
+
+Modbus RTU 帧中的 register address 和 register value 都按高字节在前传输；每个
+register 在设备数据模型中仍是一个 16-bit word。工程单位、是否有符号、比例和
+是否允许写入是四个不同问题，不能仅凭 `UINT16` 猜测可写性。
+
+| Modbus D 地址 | 已观测功能码 | 线上存储/编码 | 工程值 | 当前证据 |
+| --- | --- | --- | --- | --- |
+| D10 | FC06 request | 单个 big-endian `uint16` word | `A = raw / 10`；反向编码候选为 `raw = round(A * 10)` | 观测到请求 `raw=620`，但后续 FC03 仍读到 600；写入生效 **未确认** |
+| D11 | FC06 request | 单个 big-endian `uint16` word | `A = raw / 10`；实测 820 = 82.0 A | 请求前 800、请求 820、随后 FC03 读回 820；本次写入生效已确认 |
+| D12 | 未观测到写请求 | FC03 读取为单个 `uint16` word | `A = raw / 10`；实测 300 = 30.0 A | 只确认读语义；**不能声称可写，也不能声称使用 FC06** |
+| D30–D31 | FC10 request | 两个 big-endian `uint16` words，先 D30 高 word、再 D31 低 word，组合为 packed `uint32` | year/month/day/hour/minute/second 位域 | 多次抓到原模块写入和设备 ACK；首版 direct role 不发送 |
+
+D30–D31 的位域公式和完整原始帧见
+`docs/wifi-module-startup-sequence.md`。本表只描述已经从 clean-room 抓包验证的
+线格式，不构成对任何地址的通用写入许可。未来若加入一个可写字段，必须同时保存
+请求 raw、响应 raw、紧随其后的 FC03 读回、IoTRix/面板同刻值和失败回滚条件。
+公开的 `direct_readonly_bridge` 首版不会包含任何上述反向编码函数或 HA 写实体。
 
 ### 4.3 启动行为
 

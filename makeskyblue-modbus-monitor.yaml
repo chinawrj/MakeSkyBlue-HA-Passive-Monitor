@@ -24,16 +24,21 @@ esphome:
   friendly_name: MakeSkyBlueModbusMonitor
   project:
     name: rjwang.makeskyblue_modbus_monitor
-    version: 0.1.0-alpha.5
+    version: 0.1.0-alpha.6
   includes:
     - components/uart_capture_ring.h
     - components/passive_modbus_monitor.h
+    - components/direct_mode_preview.h
   on_boot:
     # UART buses initialize at priority 1000. Insert BOOT immediately after
     # that, before Wi-Fi (priority 250) starts connecting.
     - priority: 900
       then:
         - lambda: |-
+            direct_mode_preview::direct_mode_gate.restore(
+              id(direct_mode_requested),
+              id(direct_mode_preview_ready),
+              millis());
             do {
               id(capture_boot_id) = esp_random();
             } while (id(capture_boot_id) == 0U);
@@ -269,6 +274,24 @@ globals:
     type: uint64_t
     restore_value: no
     initial_value: "0"
+  # Preview-only one-way state. Once requested or ready becomes true it is
+  # never cleared by HA. The preview firmware still has no TX pin or write API.
+  - id: direct_mode_requested
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: direct_mode_preview_ready
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: detected_request_gpio
+    type: uint8_t
+    restore_value: yes
+    initial_value: "0"
+  - id: detected_response_gpio
+    type: uint8_t
+    restore_value: yes
+    initial_value: "0"
 
 # AtomS3-Lite onboard WS2812C RGB status indicator. It is kept internal so a
 # Home Assistant light command cannot mask monitor health/activity states.
@@ -295,6 +318,44 @@ text_sensor:
     icon: mdi:restart-alert
     entity_category: diagnostic
     update_interval: never
+  - platform: template
+    name: "Direct Mode Preview State"
+    icon: mdi:transit-connection-variant
+    entity_category: diagnostic
+    update_interval: 2s
+    lambda: return direct_mode_preview::direct_mode_gate.state();
+  - platform: template
+    name: "Detected Future TX Pin"
+    icon: mdi:serial-port
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      uint8_t gpio = id(detected_request_gpio);
+      if (direct_mode_preview::direction_detector.detected()) {
+        gpio = direct_mode_preview::direction_detector.request_source() == 1U
+                 ? 1U : 2U;
+      }
+      if (gpio == 0U) return std::string("undetected");
+      return str_sprintf("GPIO%u (request line; preview only)", gpio);
+  - platform: template
+    name: "Detected Future RX Pin"
+    icon: mdi:serial-port
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      uint8_t gpio = id(detected_response_gpio);
+      if (direct_mode_preview::direction_detector.detected()) {
+        gpio = direct_mode_preview::direction_detector.response_source() == 1U
+                 ? 1U : 2U;
+      }
+      if (gpio == 0U) return std::string("undetected");
+      return str_sprintf("GPIO%u (response line)", gpio);
+  - platform: template
+    name: "Direct Mode Preview Safety"
+    icon: mdi:shield-lock
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return {"PREVIEW_ONLY_NO_TX_COMPILED"};
   - platform: template
     name: "UART Capture Boot Session ID"
     icon: mdi:identifier
@@ -698,6 +759,55 @@ sensor:
     accuracy_decimals: 0
     update_interval: 30s
     lambda: return id(capture_last_acked_sequence);
+  - platform: template
+    name: "Direction Detection Paired Transactions"
+    icon: mdi:swap-horizontal
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return direct_mode_preview::direction_detector.paired_transactions();
+  - platform: template
+    name: "Direction Detection Conflicting Pairs"
+    icon: mdi:swap-horizontal-bold
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return direct_mode_preview::direction_detector.conflicting_pairs();
+  - platform: template
+    name: "Both UART Lines Idle"
+    icon: mdi:timer-outline
+    entity_category: diagnostic
+    unit_of_measurement: s
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      return static_cast<float>(
+        direct_mode_preview::direct_mode_gate.idle_ms(millis())) / 1000.0f;
+
+switch:
+  - platform: template
+    id: direct_mode_permanent_request
+    name: "PREVIEW Arm Direct Mode Permanently"
+    icon: mdi:lock-alert
+    entity_category: config
+    optimistic: false
+    lambda: return id(direct_mode_requested);
+    turn_on_action:
+      - lambda: |-
+          if (!id(direct_mode_requested)) {
+            id(direct_mode_requested) = true;
+            direct_mode_preview::direct_mode_gate.arm_permanently();
+            ESP_LOGW("direct_preview",
+                     "Direct mode permanently requested; waiting for 30s UART idle. Preview firmware has no TX path");
+          }
+    turn_off_action:
+      - lambda: |-
+          id(direct_mode_requested) = true;
+          direct_mode_preview::direct_mode_gate.arm_permanently();
+          id(direct_mode_permanent_request).publish_state(true);
+          ESP_LOGW("direct_preview",
+                   "Direct mode request is one-way and cannot be disabled from HA");
+
 binary_sensor:
   - platform: wireguard
     wireguard_id: makeskyblue_monitor_wireguard
@@ -705,6 +815,16 @@ binary_sensor:
       name: "WireGuard Peer Online"
     enabled:
       name: "WireGuard Enabled"
+  - platform: template
+    name: "UART Direction Automatically Detected"
+    icon: mdi:swap-horizontal-circle
+    entity_category: diagnostic
+    lambda: return direct_mode_preview::direction_detector.detected();
+  - platform: template
+    name: "Direct Mode Preview Ready"
+    icon: mdi:shield-check
+    entity_category: diagnostic
+    lambda: return id(direct_mode_preview_ready);
 
 uart:
   - id: uart_monitor_g1
@@ -730,11 +850,14 @@ uart:
       sequence:
         - lambda: |-
             const uint32_t sequence = ++id(capture_sequence);
+            const uint32_t now = millis();
             id(g1_chunk_count)++;
             id(g1_byte_count) += bytes.size();
-            modbus_capture::ring.push_uart(1, sequence, millis(), bytes);
-            passive_modbus::monitor.feed(1, sequence, millis(), bytes);
-            id(led_activity_until_ms) = millis() + 180;
+            modbus_capture::ring.push_uart(1, sequence, now, bytes);
+            passive_modbus::monitor.feed(1, sequence, now, bytes);
+            direct_mode_preview::direction_detector.feed(1, now, bytes);
+            direct_mode_preview::direct_mode_gate.note_uart_activity(now);
+            id(led_activity_until_ms) = now + 180;
 
             static const char HEX[] = "0123456789ABCDEF";
             std::string payload;
@@ -779,11 +902,14 @@ uart:
       sequence:
         - lambda: |-
             const uint32_t sequence = ++id(capture_sequence);
+            const uint32_t now = millis();
             id(g2_chunk_count)++;
             id(g2_byte_count) += bytes.size();
-            modbus_capture::ring.push_uart(2, sequence, millis(), bytes);
-            passive_modbus::monitor.feed(2, sequence, millis(), bytes);
-            id(led_activity_until_ms) = millis() + 180;
+            modbus_capture::ring.push_uart(2, sequence, now, bytes);
+            passive_modbus::monitor.feed(2, sequence, now, bytes);
+            direct_mode_preview::direction_detector.feed(2, now, bytes);
+            direct_mode_preview::direct_mode_gate.note_uart_activity(now);
+            id(led_activity_until_ms) = now + 180;
 
             static const char HEX[] = "0123456789ABCDEF";
             std::string payload;
@@ -816,6 +942,29 @@ interval:
       - lambda: |-
           const uint32_t now = millis();
           passive_modbus::monitor.tick(now);
+          direct_mode_preview::direct_mode_gate.tick(now);
+          if (direct_mode_preview::direction_detector.detected()) {
+            const uint8_t request_gpio =
+              direct_mode_preview::direction_detector.request_source() == 1U
+                ? 1U : 2U;
+            const uint8_t response_gpio =
+              direct_mode_preview::direction_detector.response_source() == 1U
+                ? 1U : 2U;
+            if (id(detected_request_gpio) != request_gpio ||
+                id(detected_response_gpio) != response_gpio) {
+              id(detected_request_gpio) = request_gpio;
+              id(detected_response_gpio) = response_gpio;
+              ESP_LOGW("direct_preview",
+                       "Auto-detected future direction: TX candidate=GPIO%u, RX=GPIO%u; preview remains RX-only",
+                       request_gpio, response_gpio);
+            }
+          }
+          if (direct_mode_preview::direct_mode_gate.preview_ready() &&
+              !id(direct_mode_preview_ready)) {
+            id(direct_mode_preview_ready) = true;
+            ESP_LOGW("direct_preview",
+                     "30s UART idle gate latched. Preview remains physically RX-only with no TX path");
+          }
           const bool activity =
             static_cast<int32_t>(id(led_activity_until_ms) - now) > 0;
           bool on = true;

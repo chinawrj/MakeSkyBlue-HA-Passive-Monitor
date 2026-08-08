@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.0-alpha.6 - 2026-08-08
+
+- Add a pure in-memory, dual-RX direction detector. Four matched FC03/FC04
+  request/response transactions are required before it identifies the observed
+  request line as the future TX candidate and the response line as future RX;
+  the detected GPIO mapping is persisted for the later physical cutover.
+- Add the one-way HA `PREVIEW Arm Direct Mode Permanently` switch. Once armed,
+  it cannot be cleared through HA and waits for 30 continuous seconds without
+  bytes on either UART before latching `preview_ready` permanently.
+- Keep the preview physically incapable of transmission: GPIO1/GPIO2 remain
+  independent floating RX inputs and generated code still has no TX pin or
+  UART-write path.
+- Add a no-I/O FC03 poll planner with exact unit-tested requests for D0–D60,
+  D100–D150, D201–D216 and D151–D200. The planner produces bytes only inside
+  memory/tests and is not connected to an ESPHome UART.
+- Replace the CI gate's undeclared `rg` dependency with a Python generated-code
+  audit, after alpha.5 proved the full firmware compile but failed only because
+  GitHub's runner did not provide ripgrep.
+
 ## 0.1.0-alpha.5 - 2026-08-08
 
 - Fix the Ubuntu `-Werror=sign-compare` failure in the coherent UINT32 bounds

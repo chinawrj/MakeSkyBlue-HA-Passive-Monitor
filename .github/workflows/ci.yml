@@ -33,6 +33,11 @@ jobs:
           c++ -std=c++17 -Wall -Wextra -Werror -I. \
             tests/passive_modbus_monitor_test.cpp -o /tmp/passive_monitor_test
           /tmp/passive_monitor_test
+      - name: Test direct-mode preview logic
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -I. \
+            tests/direct_mode_preview_test.cpp -o /tmp/direct_mode_preview_test
+          /tmp/direct_mode_preview_test
       - name: Test UART ring
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -I. \
@@ -67,9 +72,17 @@ jobs:
           esphome compile makeskyblue-modbus-monitor.yaml
       - name: Enforce generated RX-only UART boundary
         run: |
-          generated=.esphome/build/makeskybluemodbusmonitor/src/main.cpp
-          test "$(rg -c 'set_rx_pin' "$generated")" -eq 2
-          test "$(rg -c 'FLAG_INPUT' "$generated")" -eq 2
-          rg -q 'GPIO_NUM_1' "$generated"
-          rg -q 'GPIO_NUM_2' "$generated"
-          ! rg -n 'set_tx_pin|uart_write|write_array|\.write\(' "$generated"
+          python - <<'PY'
+          from pathlib import Path
+
+          generated = Path(
+              ".esphome/build/makeskybluemodbusmonitor/src/main.cpp"
+          ).read_text()
+          assert generated.count("set_rx_pin") == 2
+          assert generated.count("FLAG_INPUT") == 2
+          assert "GPIO_NUM_1" in generated
+          assert "GPIO_NUM_2" in generated
+          forbidden = ("set_tx_pin", "uart_write", "write_array", ".write(")
+          assert not any(token in generated for token in forbidden)
+          print("generated RX-only UART boundary: PASS")
+          PY

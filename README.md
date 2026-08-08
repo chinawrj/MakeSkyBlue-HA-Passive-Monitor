@@ -5,7 +5,7 @@ the 3.3 V TTL UART between a MakeSkyBlue Wi-Fi module and its inverter. It
 reassembles and validates Modbus RTU frames, pairs requests with responses,
 caches observed registers, and publishes decoded values to Home Assistant.
 
-Version documented here: `v0.1.0-alpha.5`. This is the current parsing and HA
+Version documented here: `v0.1.0-alpha.6`. This is the current parsing and HA
 sensor candidate. It is not yet the final 24-hour, zero-unknown validation
 build.
 
@@ -29,6 +29,15 @@ it will not be hidden behind a boolean TX substitution. See
 [`docs/direct-communication-module-transition.md`](docs/direct-communication-module-transition.md)
 for the captured request schedule, naming, hardware interlocks and cutover
 checklist. No direct/TX role is shipped in this release.
+
+Alpha.6 adds a no-transmit preview of that transition. Both pins remain RX and
+the firmware pairs observed FC03 requests/responses to auto-detect the future
+TX-candidate and RX pins. HA exposes a one-way
+`PREVIEW Arm Direct Mode Permanently` switch. After it is armed, both UART
+inputs must remain idle for 30 seconds before `preview_ready` latches forever.
+Even then the generated firmware has no TX pin or UART-write path. Actual
+transmission is reserved for a later release after the user explicitly confirms
+that the original Wi-Fi module has been physically removed.
 
 ## What the alpha exposes
 
@@ -149,6 +158,9 @@ c++ -std=c++17 -Wall -Wextra -Werror -I. \
 c++ -std=c++17 -Wall -Wextra -Werror -I. \
   tests/uart_capture_ring_test.cpp -o /tmp/uart_capture_ring_test
 /tmp/uart_capture_ring_test
+c++ -std=c++17 -Wall -Wextra -Werror -I. \
+  tests/direct_mode_preview_test.cpp -o /tmp/direct_mode_preview_test
+/tmp/direct_mode_preview_test
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
 .venv/bin/python tools/analyze_uart_capture.py --strict \
   --summary-json reports/session.json captures/session.log
