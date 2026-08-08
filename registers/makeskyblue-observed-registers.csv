@@ -9,7 +9,7 @@ register,register_label,status,mapped_fields,evidence
 7,D7,confirmed_semantic,battery_rated_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
 8,D8,confirmed_semantic,battery_discharge_min_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
 9,D9,confirmed_semantic,battery_discharge_start_voltage_v,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
-10,D10,confirmed_semantic,grid_to_battery_max_charge_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; FC06 request/readback mismatch also observed
+10,D10,confirmed_semantic,grid_to_battery_max_charge_current_a,"local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; FC06 requests raw 620 and 700 both read back raw 600; the raw 700 request followed an operator setting IoTRix/panel d13 to 70, independently confirming lowercase d13 maps to Modbus D10 rather than Modbus D13"
 11,D11,confirmed_semantic,pv_to_battery_max_charge_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08; FC06 changed raw 800 to 820 and FC03 read back 820
 12,D12,confirmed_semantic,inverter_max_grid_current_a,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08
 13,D13,confirmed_semantic,inverter_max_output_power_kw,local UART plus authenticated read-only IoTRix 2.2.31 settings snapshot on 2026-08-08

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.7 - 2026-08-08
+
+- Record the controlled IoTRix/panel d13=70 operation as clean-room evidence:
+  the on-wire request was FC06 Modbus D10 raw 700, its response value was zero,
+  and the first FC03 readback remained D10 raw 600.
+- Document that Modbus D13 simultaneously remained raw 70 (7.0 kW), providing
+  an independent on-wire demonstration that lowercase panel d13 and uppercase
+  Modbus D13 are different address spaces.
+- Update only the D10 evidence text and protocol guide. Register names, scaling,
+  HA entities, parser behavior and the strict RX-only electrical boundary are
+  unchanged.
+
 ## 0.1.0-alpha.6 - 2026-08-08
 
 - Add a pure in-memory, dual-RX direction detector. Four matched FC03/FC04

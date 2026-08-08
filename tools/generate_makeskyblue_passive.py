@@ -118,7 +118,8 @@ FIELD_SPECS: dict[int, tuple[FieldSpec, ...]] = {
     10: field(
         "grid_to_battery_max_charge_current_a",
         "confirmed_semantic",
-        LIVE_SETTINGS + "; FC06 request/readback mismatch also observed",
+        LIVE_SETTINGS
+        + "; FC06 requests raw 620 and 700 both read back raw 600; the raw 700 request followed an operator setting IoTRix/panel d13 to 70, independently confirming lowercase d13 maps to Modbus D10 rather than Modbus D13",
         "A",
         1,
         "passive_modbus::monitor.raw_u16(10) / 10.0f",

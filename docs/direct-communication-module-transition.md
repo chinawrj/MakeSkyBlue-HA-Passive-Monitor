@@ -126,7 +126,7 @@ register 在设备数据模型中仍是一个 16-bit word。工程单位、是�
 
 | Modbus D 地址 | 已观测功能码 | 线上存储/编码 | 工程值 | 当前证据 |
 | --- | --- | --- | --- | --- |
-| D10 | FC06 request | 单个 big-endian `uint16` word | `A = raw / 10`；反向编码候选为 `raw = round(A * 10)` | 观测到请求 `raw=620`，但后续 FC03 仍读到 600；写入生效 **未确认** |
+| D10 | FC06 request | 单个 big-endian `uint16` word | `A = raw / 10`；反向编码候选为 `raw = round(A * 10)` | 两次观测到请求 `raw=620`、`raw=700`，后续 FC03 都仍读到 600；后者来自 IoTRix/面板 d13=70，写入生效 **未确认** |
 | D11 | FC06 request | 单个 big-endian `uint16` word | `A = raw / 10`；实测 820 = 82.0 A | 请求前 800、请求 820、随后 FC03 读回 820；本次写入生效已确认 |
 | D12 | 未观测到写请求 | FC03 读取为单个 `uint16` word | `A = raw / 10`；实测 300 = 30.0 A | 只确认读语义；**不能声称可写，也不能声称使用 FC06** |
 | D30–D31 | FC10 request | 两个 big-endian `uint16` words，先 D30 高 word、再 D31 低 word，组合为 packed `uint32` | year/month/day/hour/minute/second 位域 | 多次抓到原模块写入和设备 ACK；首版 direct role 不发送 |
@@ -136,6 +136,8 @@ D30–D31 的位域公式和完整原始帧见
 线格式，不构成对任何地址的通用写入许可。未来若加入一个可写字段，必须同时保存
 请求 raw、响应 raw、紧随其后的 FC03 读回、IoTRix/面板同刻值和失败回滚条件。
 公开的 `direct_readonly_bridge` 首版不会包含任何上述反向编码函数或 HA 写实体。
+IoTRix/面板小写 d13=70 的线事务实际落在 Modbus D10=700；同一读回中的
+Modbus D13=70 表示 7.0 kW。未来实现必须把这两个命名空间作为不同字段处理。
 
 ### 4.3 启动行为
 
