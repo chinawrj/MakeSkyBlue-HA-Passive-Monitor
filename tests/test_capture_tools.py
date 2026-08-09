@@ -27,6 +27,7 @@ from tools.analyze_uart_capture import (
     sequence_integrity,
     timestamp_iso8601,
 )
+from tools.capture_esphome_logs import stale_output_due
 from tools.generate_makeskyblue_passive import (
     OBSERVED_REGISTERS,
     UPDATE_INTERVAL_SECONDS,
@@ -323,6 +324,29 @@ class ParseChunkTests(unittest.TestCase):
         self.assertTrue(metadata["capture_complete"])
         self.assertEqual(metadata["capture_elapsed_seconds"], 86400)
 
+    def test_capture_metadata_preserves_transport_watchdog_events(self) -> None:
+        metadata = parse_capture_metadata(
+            [
+                "2026-08-08T00:00:00+08:00 CAPTURE_START device=x duration_seconds=86400 git_commit=abc git_dirty=false config_sha256=aa firmware_sha256=bb stale_output_seconds=120 heartbeat_seconds=30",
+                "2026-08-08T00:00:00+08:00 CONNECT_ATTEMPT device=x",
+                "2026-08-08T00:00:30+08:00 CAPTURE_HEARTBEAT child_pid=123 child_alive=true seconds_since_output=0.500",
+                "2026-08-08T00:02:00+08:00 STALE_OUTPUT child_pid=123 seconds_since_output=120.001 action=reconnect",
+                "2026-08-08T00:02:00+08:00 DISCONNECTED reason=stale_output returncode=-15 retry_seconds=3.0",
+            ]
+        )
+        self.assertEqual(metadata["transport_connect_attempt_count"], 1)
+        self.assertEqual(metadata["transport_disconnect_count"], 1)
+        self.assertEqual(metadata["transport_stale_output_count"], 1)
+        self.assertEqual(metadata["capture_heartbeat_count"], 1)
+        self.assertEqual(metadata["capture_stale_output_limit_seconds"], 120)
+        self.assertEqual(
+            metadata["capture_transport_events"][-1]["reason"], "stale_output"
+        )
+
+    def test_capture_stale_output_watchdog_boundary(self) -> None:
+        self.assertFalse(stale_output_due(10.0, 129.999, 120.0))
+        self.assertTrue(stale_output_due(10.0, 130.0, 120.0))
+
     def test_strict_requires_every_catalog_address_to_be_read(self) -> None:
         with TemporaryDirectory() as directory:
             result, summary = self._run_strict_fixture(
@@ -463,6 +487,25 @@ class ParseChunkTests(unittest.TestCase):
         self.assertEqual(gaps[0]["expected"], 3)
         self.assertEqual(gaps[0]["missing_count"], 1)
         self.assertEqual(len(out_of_order), 1)
+
+    def test_sequence_integrity_retains_every_gap_with_context(self) -> None:
+        chunks = [
+            Chunk(
+                sequence,
+                1 if sequence % 4 == 1 else 2,
+                b"x",
+                boot_id=7,
+                order=order,
+                timestamp_ms=1786118400000 + order * 1000,
+            )
+            for order, sequence in enumerate(range(1, 52, 2))
+        ]
+        gaps, _ = sequence_integrity(chunks)
+        self.assertEqual(len(gaps), 25)
+        self.assertEqual(gaps[-1]["expected"], 50)
+        self.assertEqual(gaps[-1]["before"], 51)
+        self.assertEqual(gaps[-1]["after_timestamp_ms"], 1786118424000)
+        self.assertEqual(gaps[-1]["before_timestamp_ms"], 1786118425000)
 
     def test_strict_accepts_complete_capture_with_only_log_reordering(self) -> None:
         with TemporaryDirectory() as directory_name:

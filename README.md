@@ -5,7 +5,7 @@ the 3.3 V TTL UART between a MakeSkyBlue Wi-Fi module and its inverter. It
 reassembles and validates Modbus RTU frames, pairs requests with responses,
 caches observed registers, and publishes decoded values to Home Assistant.
 
-Version documented here: `v0.1.0-alpha.8`. This is the current parsing and HA
+Version documented here: `v0.1.0-alpha.9`. This is the current parsing and HA
 sensor candidate. It is not yet the final 24-hour, zero-unknown validation
 build.
 
@@ -124,6 +124,10 @@ raw-context rows rather than being hidden behind aggregate counters.
 Sequence integrity reports true missing-number ranges/counts separately from
 logger emission reordering; reassembly follows the boot-local sequence, so a
 complete but out-of-order log is not mislabeled as byte loss.
+The capture process writes a local heartbeat every 30 seconds and reconnects an
+apparently live `esphome logs` child after 120 seconds without output. Transport
+events, every sequence-gap range, and every parse-issue context are retained in
+the analyzer JSON instead of being silently truncated.
 
 ## Home Assistant
 

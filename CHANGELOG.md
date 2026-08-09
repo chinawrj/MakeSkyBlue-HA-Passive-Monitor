@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-alpha.9 - 2026-08-09
+
+- Add a host-side capture watchdog: record a local heartbeat every 30 seconds
+  and reconnect an `esphome logs` child that remains alive without output for
+  120 seconds. This only renews the ESPHome API log subscription and never
+  opens or writes either monitored UART.
+- Preserve connect, disconnect, stale-subscription and capture-heartbeat events
+  in analyzer JSON so an API evidence outage is not mislabeled as UART silence.
+- Remove the previous 20-gap and 50-parse-context report truncation. Every
+  sequence gap now retains its boot, direction, surrounding sequence numbers,
+  log order and timestamps; every parse issue retains its raw context.
+
 ## 0.1.0-alpha.8 - 2026-08-08
 
 - Correlate a user-confirmed IoTRix “enable force-charge schedule” action with

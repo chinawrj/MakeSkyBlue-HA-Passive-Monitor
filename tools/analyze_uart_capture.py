@@ -34,9 +34,27 @@ CAPTURE_START_RE = re.compile(
     r"^(?P<timestamp>\S+) CAPTURE_START .*duration_seconds=(?P<duration>\d+) "
     r"git_commit=(?P<commit>\S+) git_dirty=(?P<dirty>true|false) "
     r"config_sha256=(?P<config_sha256>\S+) firmware_sha256=(?P<firmware_sha256>\S+)"
+    r"(?: stale_output_seconds=(?P<stale_output_seconds>[0-9.]+)"
+    r" heartbeat_seconds=(?P<heartbeat_seconds>[0-9.]+))?"
 )
 CAPTURE_END_RE = re.compile(
     r"^(?P<timestamp>\S+) CAPTURE_END reason=(?P<reason>\S+)"
+)
+CONNECT_ATTEMPT_RE = re.compile(
+    r"^(?P<timestamp>\S+) CONNECT_ATTEMPT device=(?P<device>\S+)"
+)
+DISCONNECTED_RE = re.compile(
+    r"^(?P<timestamp>\S+) DISCONNECTED(?: reason=(?P<reason>\S+)"
+    r" returncode=(?P<returncode>-?\d+))? retry_seconds=(?P<retry_seconds>[0-9.]+)"
+)
+STALE_OUTPUT_RE = re.compile(
+    r"^(?P<timestamp>\S+) STALE_OUTPUT child_pid=(?P<child_pid>\d+) "
+    r"seconds_since_output=(?P<seconds_since_output>[0-9.]+) action=reconnect"
+)
+CAPTURE_HEARTBEAT_RE = re.compile(
+    r"^(?P<timestamp>\S+) CAPTURE_HEARTBEAT child_pid=(?P<child_pid>\d+) "
+    r"child_alive=(?P<child_alive>true|false) "
+    r"seconds_since_output=(?P<seconds_since_output>[0-9.]+)"
 )
 
 
@@ -499,18 +517,24 @@ def frame_completion_order(frame: Frame) -> tuple[int, int, int]:
 
 def sequence_integrity(
     chunks: list[Chunk],
-) -> tuple[list[dict[str, int]], list[dict[str, int]]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     """Separate missing sequence numbers from logger emission reordering."""
     sequences_by_boot: dict[int, set[int]] = {}
     for chunk in chunks:
         sequences_by_boot.setdefault(chunk.boot_id, set()).add(chunk.sequence)
 
-    gaps: list[dict[str, int]] = []
+    first_chunk_by_key: dict[tuple[int, int], Chunk] = {}
+    for chunk in chunks:
+        first_chunk_by_key.setdefault((chunk.boot_id, chunk.sequence), chunk)
+
+    gaps: list[dict[str, object]] = []
     for boot_id, sequences in sequences_by_boot.items():
         ordered = sorted(sequences)
         for previous, current in zip(ordered, ordered[1:]):
             if current == previous + 1:
                 continue
+            previous_chunk = first_chunk_by_key[(boot_id, previous)]
+            current_chunk = first_chunk_by_key[(boot_id, current)]
             gaps.append(
                 {
                     "boot_id": boot_id,
@@ -518,10 +542,22 @@ def sequence_integrity(
                     "before": current,
                     "expected": previous + 1,
                     "missing_count": current - previous - 1,
+                    "after_source": f"G{previous_chunk.source}",
+                    "before_source": f"G{current_chunk.source}",
+                    "after_log_order": previous_chunk.order,
+                    "before_log_order": current_chunk.order,
+                    "after_timestamp_ms": previous_chunk.timestamp_ms,
+                    "before_timestamp_ms": current_chunk.timestamp_ms,
+                    "after_timestamp_iso8601": timestamp_iso8601(
+                        previous_chunk.timestamp_ms
+                    ),
+                    "before_timestamp_iso8601": timestamp_iso8601(
+                        current_chunk.timestamp_ms
+                    ),
                 }
             )
 
-    out_of_order: list[dict[str, int]] = []
+    out_of_order: list[dict[str, object]] = []
     previous_by_boot: dict[int, Chunk] = {}
     for chunk in chunks:
         previous = previous_by_boot.get(chunk.boot_id)
@@ -533,6 +569,14 @@ def sequence_integrity(
                     "before": chunk.sequence,
                     "previous_log_order": previous.order,
                     "current_log_order": chunk.order,
+                    "previous_timestamp_ms": previous.timestamp_ms,
+                    "current_timestamp_ms": chunk.timestamp_ms,
+                    "previous_timestamp_iso8601": timestamp_iso8601(
+                        previous.timestamp_ms
+                    ),
+                    "current_timestamp_iso8601": timestamp_iso8601(
+                        chunk.timestamp_ms
+                    ),
                 }
             )
         previous_by_boot[chunk.boot_id] = chunk
@@ -555,6 +599,7 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
 def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
     starts: list[re.Match[str]] = []
     ends: list[re.Match[str]] = []
+    transport_events: list[dict[str, object]] = []
     for line in lines:
         start = CAPTURE_START_RE.match(line)
         if start:
@@ -562,10 +607,56 @@ def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
         end = CAPTURE_END_RE.match(line)
         if end:
             ends.append(end)
+        for kind, pattern in (
+            ("connect_attempt", CONNECT_ATTEMPT_RE),
+            ("disconnected", DISCONNECTED_RE),
+            ("stale_output", STALE_OUTPUT_RE),
+            ("capture_heartbeat", CAPTURE_HEARTBEAT_RE),
+        ):
+            event = pattern.match(line)
+            if not event:
+                continue
+            values = dict(
+                (name, value)
+                for name, value in event.groupdict().items()
+                if value is not None
+            )
+            event_time = dt.datetime.fromisoformat(
+                values["timestamp"].replace("Z", "+00:00")
+            )
+            values.update(
+                {
+                    "kind": kind,
+                    "timestamp_ms": int(event_time.timestamp() * 1000),
+                }
+            )
+            for key in ("child_pid", "returncode"):
+                if key in values:
+                    values[key] = int(values[key])
+            for key in ("retry_seconds", "seconds_since_output"):
+                if key in values:
+                    values[key] = float(values[key])
+            if "child_alive" in values:
+                values["child_alive"] = values["child_alive"] == "true"
+            transport_events.append(values)
+            break
     result: dict[str, object] = {
         "capture_start_count": len(starts),
         "capture_end_count": len(ends),
         "capture_complete": False,
+        "transport_connect_attempt_count": sum(
+            event["kind"] == "connect_attempt" for event in transport_events
+        ),
+        "transport_disconnect_count": sum(
+            event["kind"] == "disconnected" for event in transport_events
+        ),
+        "transport_stale_output_count": sum(
+            event["kind"] == "stale_output" for event in transport_events
+        ),
+        "capture_heartbeat_count": sum(
+            event["kind"] == "capture_heartbeat" for event in transport_events
+        ),
+        "capture_transport_events": transport_events,
     }
     if len(starts) == 1:
         start_time = dt.datetime.fromisoformat(
@@ -582,6 +673,13 @@ def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
                 "firmware_sha256": starts[0].group("firmware_sha256"),
             }
         )
+        if starts[0].group("stale_output_seconds") is not None:
+            result["capture_stale_output_limit_seconds"] = float(
+                starts[0].group("stale_output_seconds")
+            )
+            result["capture_heartbeat_interval_seconds"] = float(
+                starts[0].group("heartbeat_seconds")
+            )
     if len(starts) == 1 and len(ends) == 1:
         start_time = dt.datetime.fromisoformat(
             starts[0].group("timestamp").replace("Z", "+00:00")
@@ -957,12 +1055,12 @@ def main() -> int:
         "first_sequence": chunks[0].sequence if chunks else None,
         "last_sequence": chunks[-1].sequence if chunks else None,
         "sequence_gap_count": len(sequence_gaps),
-        "sequence_gaps": sequence_gaps[:20],
+        "sequence_gaps": sequence_gaps,
         "missing_sequence_count": sum(
             gap["missing_count"] for gap in sequence_gaps
         ),
         "sequence_out_of_order_count": len(sequence_out_of_order),
-        "sequence_out_of_order": sequence_out_of_order[:20],
+        "sequence_out_of_order": sequence_out_of_order,
         "frames": len(frames),
         "observed_modbus_slave_addresses": observed_modbus_slave_addresses,
         "observed_modbus_slave_address_count": len(
@@ -1037,7 +1135,7 @@ def main() -> int:
             }
             for (boot_id, source), state in states.items()
             for issue in state.issues
-        ][:50],
+        ],
         "streams": {
             f"boot={boot_id}/G{source}": {
                 "discarded_bytes": state.discarded_bytes,

@@ -249,6 +249,12 @@ unresolved 地址（93 个 raw-only 加 18 个 provisional）；这不是工具�
 采集器默认拒绝追加到已有文件，并在 `CAPTURE_START` 写入 Git commit、dirty
 状态、配置 SHA-256 和 OTA firmware SHA-256。只有 `duration_complete` 且进程退出
 码为 0 才算完成；收到 signal 会写 `CAPTURE_END reason=signal` 并返回 130。
+采集器每 30 秒写入一个只反映本机采集进程状态的 `CAPTURE_HEARTBEAT`。如果
+`esphome logs` 子进程仍存活却连续 120 秒没有任何输出，采集器会先写
+`STALE_OUTPUT`，再终止该子进程并重新连接。这个 watchdog 只操作 ESPHome API
+日志订阅，不打开 UART，也不发送任何 UART 字节。`STALE_OUTPUT` 说明日志订阅
+缺少输出，不能单独证明逆变器 UART 停止；必须结合 sequence 缺号、UART 时间戳
+和重连后的 ring/状态恢复结果判断证据是否丢失。
 
 ## Step 11：重复 Wi-Fi 模块热插拔实验
 
@@ -327,6 +333,10 @@ coverage 没有回退。当前 clean-room 候选基线是 67/178；新增语义�
 分析报告里的 `missing_sequence_count` 才表示真正缺号；
 `sequence_out_of_order_count` 表示日志输出次序与采集序号不同。后者必须保留
 上下文供审计，但只要所有序号都存在且按序重组后帧完整，就不等同于数据丢失。
+`transport_connect_attempt_count`、`transport_disconnect_count`、
+`transport_stale_output_count` 和完整的 `capture_transport_events` 用来区分采集端
+重连与线上的 UART 活动。报告不得只保留前若干 gap 或 parse issue；当前分析器
+会保存每个缺号范围和每个解析问题的方向、序号、时间与 raw hex 上下文。
 通信地址则查看 `Observed Modbus Communication Addresses`：它来自合法帧首
 字节，不来自 D 寄存器。本机应为 `1`；若出现多个地址，必须在报告中保留各自
 请求/响应原始帧并分别验证配对。
