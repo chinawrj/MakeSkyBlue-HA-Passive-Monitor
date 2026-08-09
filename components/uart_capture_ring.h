@@ -17,6 +17,7 @@ static constexpr size_t MAX_PAYLOAD = 96;
 enum class RecordType : uint8_t {
   BOOT = 0,
   UART = 1,
+  HEARTBEAT = 2,
 };
 
 struct Record {
@@ -48,6 +49,14 @@ class CaptureRing {
     record.uptime_ms = uptime_ms;
     record.length = static_cast<uint16_t>(std::min(bytes.size(), MAX_PAYLOAD));
     std::copy_n(bytes.begin(), record.length, record.payload.begin());
+    this->push_(record);
+  }
+
+  void push_heartbeat(uint32_t sequence, uint32_t uptime_ms) {
+    Record record{};
+    record.type = RecordType::HEARTBEAT;
+    record.sequence = sequence;
+    record.uptime_ms = uptime_ms;
     this->push_(record);
   }
 
@@ -83,7 +92,9 @@ class CaptureRing {
   bool has_staged() const { return this->staged_valid_; }
 
   std::string staged_type() const {
-    return this->staged_.type == RecordType::BOOT ? "BOOT" : "UART";
+    if (this->staged_.type == RecordType::BOOT) return "BOOT";
+    if (this->staged_.type == RecordType::HEARTBEAT) return "HEARTBEAT";
+    return "UART";
   }
 
   std::string staged_source() const {

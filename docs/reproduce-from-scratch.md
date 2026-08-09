@@ -54,7 +54,7 @@ UART TX/RX 连接，AtomS3 只并联监听：
 ```sh
 git clone https://github.com/chinawrj/MakeSkyBlue-HA-Passive-Monitor.git
 cd MakeSkyBlue-HA-Passive-Monitor
-git checkout v0.1.0-alpha.4
+git checkout v0.1.0-alpha.10
 ```
 
 如果仓库仍处于公开许可审查阶段，需要仓库所有者先授予读取权限。不要从未知
@@ -308,9 +308,20 @@ second =           packed        & 0x3F
 
 ## Step 13：运行完整 24 小时验证
 
+正式窗口开始前，按这个顺序操作，避免一个 CSV 混入两个 boot：
+
+1. 关闭 HA 自动化 **Record MakeSkyBlue Modbus UART**，等待当前文件大小稳定；
+2. 归档旧文件，创建只含表头的新 `/config/modbus_uart_capture.csv`；
+3. 重启监听器，使新的 BOOT 暂存在设备 ring 中；
+4. 启动下面的本地 API 元数据日志，确认日志只出现这个新 boot；
+5. 重新开启 HA 自动化，确认 BOOT、UART、HEARTBEAT 依序追加、
+   `UART Capture Records ACKed` 增长且 `UART Ring Overwritten Records` 保持 0。
+
+不要清空仍在被 File integration 写入的文件，也不要在正式窗口中再次重启监听器。
+
 ```sh
 .venv/bin/python tools/capture_esphome_logs.py \
-  --duration 86400 \
+  --duration 86460 \
   --output captures/uart-24h.log
 ```
 
@@ -319,18 +330,28 @@ second =           packed        & 0x3F
 ```sh
 wc -c -l captures/uart-24h.log
 pgrep -af capture_esphome_logs.py
+# 从 HA 复制只读快照；按本地环境替换 HA_USER 和 HA_HOST。
+scp HA_USER@HA_HOST:/config/modbus_uart_capture.csv \
+  captures/modbus_uart_capture.snapshot.csv
 mkdir -p reports/30min
 checkpoint="reports/30min/$(date +%Y%m%d-%H%M%S).json"
 .venv/bin/python tools/analyze_uart_capture.py captures/uart-24h.log \
+  --ha-csv captures/modbus_uart_capture.snapshot.csv \
   --summary-json "$checkpoint" >/dev/null
-shasum -a 256 -c "${checkpoint}.sha256"
+(cd "$(dirname "$checkpoint")" && \
+  shasum -a 256 -c "$(basename "${checkpoint}.sha256")")
 ```
+
+上述 `scp` 在 HA 仍追加时只是诊断快照，不是原子快照；若 analyzer 报 CSV 尾行
+不完整，等待下一次 ACK 后重新复制，保留失败报告但不要据此宣称 UART 丢包。
 
 同时在 HA 检查：设备 online、sequence 增长、ring overwritten 为 0、CRC/unknown/
 discarded/unpaired/expired 为 0，以及 independently confirmed semantic
 coverage 没有回退。当前 clean-room 候选基线是 67/178；新增语义必须
 附带本项目抓包或 IoTRix 交叉验证证据。
-分析报告里的 `missing_sequence_count` 才表示真正缺号；
+使用 `--ha-csv` 后，顶层 `missing_sequence_count` 才表示 ACK 持久化数据中的真正
+缺号；`api_log_missing_sequence_count` 只表示 API 诊断日志订阅缺口，不能覆盖完整
+HA CSV 的结论。
 `sequence_out_of_order_count` 表示日志输出次序与采集序号不同。后者必须保留
 上下文供审计，但只要所有序号都存在且按序重组后帧完整，就不等同于数据丢失。
 `transport_connect_attempt_count`、`transport_disconnect_count`、
@@ -341,17 +362,25 @@ coverage 没有回退。当前 clean-room 候选基线是 67/178；新增语义�
 字节，不来自 D 寄存器。本机应为 `1`；若出现多个地址，必须在报告中保留各自
 请求/响应原始帧并分别验证配对。
 
-24小时结束后运行严格验收：
+24小时结束后运行严格验收。不要在主机计时刚到 86400 秒时立即冻结 CSV：30 秒
+HEARTBEAT 会量化设备 uptime 证据。保持自动化开启，直到最新 HEARTBEAT 证明
+`device_uptime_span_seconds >= 86400`，并且最新持久化行的 `buffer_remaining=0`。
+还要确认该自动化没有正在执行或排队的实例。然后立即关闭
+**Record MakeSkyBlue Modbus UART**，等待 CSV 大小连续两次检查保持不变，再复制
+新的最终快照；30分钟巡检时复制的活动文件不能充当最终快照。
 
 ```sh
 mkdir -p reports/final
 .venv/bin/python tools/analyze_uart_capture.py --strict \
+  --ha-csv captures/modbus_uart_capture.snapshot.csv \
+  --expected-project-version 0.1.0-alpha.10 \
   --frames-csv captures/uart-24h-frames.csv \
   --registers-csv captures/uart-24h-registers.csv \
   --summary-json reports/final/uart-24h-strict.json \
   captures/uart-24h.log >/dev/null
-shasum -a 256 -c reports/final/uart-24h-strict.json.sha256
+(cd reports/final && shasum -a 256 -c uart-24h-strict.json.sha256)
 shasum -a 256 captures/uart-24h.log \
+  captures/modbus_uart_capture.snapshot.csv \
   captures/uart-24h-frames.csv captures/uart-24h-registers.csv \
   reports/final/uart-24h-strict.json \
   > reports/final/uart-24h.sha256

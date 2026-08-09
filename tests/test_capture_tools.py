@@ -22,6 +22,8 @@ from tools.analyze_uart_capture import (
     modbus_crc,
     parse_capture_metadata,
     parse_chunks,
+    parse_ha_capture_csv,
+    parse_log_sequence_records,
     request_details,
     response_matches,
     sequence_integrity,
@@ -67,7 +69,11 @@ class ParseChunkTests(unittest.TestCase):
             f"{end_timestamp} CAPTURE_END reason=duration_complete\n",
             encoding="utf-8",
         )
-        tool = Path(__file__).resolve().parent.parent / "tools" / "analyze_uart_capture.py"
+        tool = (
+            Path(__file__).resolve().parent.parent
+            / "tools"
+            / "analyze_uart_capture.py"
+        )
         result = subprocess.run(
             [
                 sys.executable,
@@ -92,11 +98,128 @@ class ParseChunkTests(unittest.TestCase):
         checksum = (directory / "summary.json.sha256").read_text(encoding="utf-8")
         assert checksum == (
             f"{hashlib.sha256(result.stdout.encode()).hexdigest()}  "
-            f"{(directory / 'summary.json').resolve()}\n"
+            "summary.json\n"
         )
-        assert summary["capture_path"] == str(capture.resolve())
+        assert summary["capture_path"] == str(capture)
         assert len(summary["capture_sha256"]) == 64
         return result, summary
+
+    @staticmethod
+    def _run_ha_csv_strict_fixture(
+        directory: Path,
+        *,
+        overwritten_total: int = 0,
+        conflicting_duplicate: bool = False,
+        malformed_gpio: bool = False,
+        include_boot: bool = True,
+        response_uptime_ms: int = 200,
+        include_other_boot: bool = False,
+        boot_sequence: int = 1,
+        final_buffer_remaining: int = 0,
+        include_api_uart: bool = True,
+        duration_seconds: int = 1,
+        capture_end_timestamp: str = "2026-08-08T00:00:01+08:00",
+        heartbeat_uptime_ms: int | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        mapping = directory / "mapping.csv"
+        mapping.write_text(
+            "register,register_label,status,mapped_fields,evidence\n"
+            "0,D0,confirmed_semantic,field_0,test\n",
+            encoding="utf-8",
+        )
+        capture = directory / "capture.log"
+        api_uart_lines = (
+            "2026-08-08T00:00:00.100+08:00 boot=7 #2 G1/GPIO1 8B "
+            "RAW_HEX=01.03.00.00.00.01.84.0A\n"
+            "2026-08-08T00:00:00.200+08:00 boot=7 #5 G2/GPIO2 7B "
+            "RAW_HEX=01.03.02.00.01.79.84\n"
+            if include_api_uart
+            else ""
+        )
+        capture.write_text(
+            (
+            "2026-08-08T00:00:00+08:00 CAPTURE_START device=x "
+            f"duration_seconds={duration_seconds} git_commit=abc git_dirty=false "
+            "config_sha256=aa firmware_sha256=bb\n"
+            "2026-08-08T00:00:00.010+08:00 [I][app]: Project "
+            "rjwang.makeskyblue_modbus_monitor version 0.1.0-alpha.10\n"
+            + api_uart_lines
+            + f"{capture_end_timestamp} CAPTURE_END reason=duration_complete\n"
+            ),
+            encoding="utf-8",
+        )
+        header = (
+            "ha_timestamp,boot_id,record_type,sequence,uptime_ms,source,gpio,"
+            "byte_count,overwritten_total,buffer_remaining,message,hex\n"
+        )
+        rows = []
+        if include_boot:
+            rows.append(
+                "2026-08-08T00:00:00.050+08:00,7,BOOT,"
+                f"{boot_sequence},10,ONBOARD,INTERNAL,"
+                f"0,{overwritten_total},2,BOOT test,"
+            )
+        rows.extend(
+            [
+                "2026-08-08T00:00:00.100+08:00,7,UART,2,100,G1,"
+                f"{'GPIO2' if malformed_gpio else 'GPIO1'},8,{overwritten_total},1,,"
+                "010300000001840A",
+                "2026-08-08T00:00:00.200+08:00,7,UART,3,"
+                f"{response_uptime_ms},G2,GPIO2,7,"
+                f"{overwritten_total},0,,01030200017984",
+                # At-least-once replay: HA timestamp/buffer depth may differ while
+                # the record identity and stable payload remain identical.
+                "2026-08-08T00:00:00.300+08:00,7,UART,3,"
+                f"{response_uptime_ms},G2,GPIO2,7,"
+                f"{overwritten_total},2,,"
+                + (
+                    "01030200027985"
+                    if conflicting_duplicate
+                    else "01030200017984"
+                ),
+                "2026-08-08T00:00:01.000+08:00,7,HEARTBEAT,4,"
+                f"{heartbeat_uptime_ms if heartbeat_uptime_ms is not None else max(1010, response_uptime_ms + 10)},"
+                "ONBOARD,INTERNAL,0,"
+                f"{overwritten_total},{final_buffer_remaining},"
+                "HEARTBEAT test,",
+            ]
+        )
+        if include_other_boot:
+            rows.append(
+                "2026-08-08T00:00:00.400+08:00,8,BOOT,1,10,ONBOARD,INTERNAL,"
+                "0,0,0,BOOT other session,"
+            )
+        ha_csv = directory / "ha.csv"
+        ha_csv.write_text(header + "\n".join(rows) + "\n", encoding="utf-8")
+        tool = (
+            Path(__file__).resolve().parent.parent
+            / "tools"
+            / "analyze_uart_capture.py"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(tool),
+                "--strict",
+                "--ha-csv",
+                str(ha_csv),
+                "--boot-id",
+                "7",
+                "--expected-project-version",
+                "0.1.0-alpha.10",
+                "--mapping-csv",
+                str(mapping),
+                "--min-duration-seconds",
+                str(duration_seconds),
+                "--max-idle-seconds",
+                "10",
+                str(capture),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result, json.loads(result.stdout)
 
     def test_short_chunk_without_repeated_length(self) -> None:
         chunks = parse_chunks(
@@ -144,10 +267,160 @@ class ParseChunkTests(unittest.TestCase):
         )
         self.assertEqual([(c.boot_id, c.sequence) for c in chunks], [(11, 1), (22, 1)])
         self.assertLess(chunks[0].timestamp_ms, chunks[1].timestamp_ms)
+        self.assertIsNone(chunks[0].uptime_ms)
+
+    def test_api_log_sequence_includes_boot_and_device_heartbeat(self) -> None:
+        lines = [
+            "2026-08-08T00:00:00+08:00 [W][modbus_buffer]: BOOT "
+            "session=7 buffered as seq=1 uptime_ms=5, ring capacity=256 records",
+            "2026-08-08T00:00:00.100+08:00 boot=7 #2 G1/GPIO1 8B "
+            "RAW_HEX=01.03.00.00.00.01.84.0A",
+            "2026-08-08T00:00:30+08:00 [I][modbus_checkpoint]: "
+            "boot=7 #3 HEARTBEAT uptime_ms=30005",
+            "2026-08-08T00:00:30.100+08:00 boot=7 #4 G2/GPIO2 7B "
+            "RAW_HEX=01.03.02.00.01.79.84",
+        ]
+        uart_chunks = parse_chunks(lines)
+        records = parse_log_sequence_records(lines, uart_chunks)
+        gaps, out_of_order = sequence_integrity(records)
+        self.assertEqual([record.sequence for record in records], [1, 2, 3, 4])
+        self.assertEqual([record.source for record in records], [0, 1, 0, 2])
+        self.assertEqual(records[2].uptime_ms, 30005)
+        self.assertEqual(gaps, [])
+        self.assertEqual(out_of_order, [])
 
     def test_mismatched_length_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             parse_chunks(["#136 G1/GPIO1 2B RAW_HEX=01"])
+
+    def test_ha_csv_is_authoritative_and_allows_identical_replay(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            result, summary = self._run_ha_csv_strict_fixture(
+                directory
+            )
+            persisted = parse_ha_capture_csv(directory / "ha.csv", 7)
+            request_frames = feed(
+                StreamState(role="request"), persisted.uart_chunks[0]
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(summary["analysis_chunk_source"], "ha_csv")
+        self.assertEqual(summary["first_sequence"], 1)
+        self.assertEqual(summary["last_sequence"], 4)
+        self.assertEqual(summary["missing_sequence_count"], 0)
+        self.assertEqual(summary["api_log_missing_sequence_count"], 2)
+        self.assertEqual(summary["ha_csv_duplicate_record_count"], 1)
+        self.assertEqual(summary["ha_csv_conflicting_duplicate_count"], 0)
+        self.assertEqual(summary["ha_csv_boot_record_count"], 1)
+        self.assertEqual(summary["ha_csv_heartbeat_record_count"], 1)
+        self.assertEqual(summary["ha_csv_max_overwritten_total"], 0)
+        self.assertEqual(
+            summary["capture_reported_projects"],
+            [
+                {
+                    "project": "rjwang.makeskyblue_modbus_monitor",
+                    "version": "0.1.0-alpha.10",
+                }
+            ],
+        )
+        self.assertEqual(persisted.uart_chunks[0].uptime_ms, 100)
+        self.assertEqual(request_frames[0].uptime_ms, 100)
+        self.assertEqual(
+            summary["max_uart_idle_segment"]["time_basis"], "device_uptime"
+        )
+
+    def test_ha_csv_requires_final_ring_drain(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), final_buffer_remaining=5
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["ha_csv_last_buffer_remaining"], 5)
+
+    def test_explicit_ha_boot_does_not_require_api_uart_chunks(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), include_api_uart=False
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(summary["api_log_chunk_count"], 0)
+        self.assertEqual(summary["api_log_boot_session_count"], 0)
+
+    def test_ha_wall_clock_delay_cannot_fake_24h_device_activity(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name),
+                duration_seconds=86400,
+                capture_end_timestamp="2026-08-09T00:00:00+08:00",
+                heartbeat_uptime_ms=1010,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["capture_elapsed_seconds"], 86400)
+        self.assertEqual(summary["device_uptime_span_seconds"], 1.0)
+
+    def test_ha_csv_conflicting_duplicate_fails_strict_with_raw_context(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), conflicting_duplicate=True
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["ha_csv_conflicting_duplicate_count"], 1)
+        conflict = summary["ha_csv_conflicting_duplicates"][0]
+        self.assertEqual(conflict["boot_id"], 7)
+        self.assertEqual(conflict["sequence"], 3)
+        self.assertEqual(conflict["first_hex"], "01030200017984")
+        self.assertEqual(conflict["conflicting_hex"], "01030200027985")
+
+    def test_ha_csv_uses_device_uptime_to_reject_compressed_append_gap(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), response_uptime_ms=100_200
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(
+            summary["max_uart_idle_segment"]["time_basis"], "device_uptime"
+        )
+        self.assertAlmostEqual(summary["max_uart_idle_seconds"], 100.1)
+
+    def test_ha_csv_malformed_gpio_and_overwrite_fail_strict(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            result, summary = self._run_ha_csv_strict_fixture(
+                directory, overwritten_total=4, malformed_gpio=True
+            )
+            parsed = parse_ha_capture_csv(directory / "ha.csv", 7)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["ha_csv_malformed_row_count"], 1)
+        self.assertIn(
+            "source and gpio disagree",
+            summary["ha_csv_malformed_rows"][0]["reason"],
+        )
+        self.assertEqual(summary["ha_csv_max_overwritten_total"], 4)
+        self.assertEqual(parsed.summary["ha_csv_max_overwritten_total"], 4)
+
+    def test_ha_csv_requires_the_onboarding_record(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), include_boot=False
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["ha_csv_boot_record_count"], 0)
+
+    def test_ha_csv_rejects_another_boot_in_the_formal_file(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), include_other_boot=True
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["ha_csv_other_boot_rows"], 1)
+
+    def test_ha_csv_requires_boot_sequence_one(self) -> None:
+        with TemporaryDirectory() as directory_name:
+            result, summary = self._run_ha_csv_strict_fixture(
+                Path(directory_name), boot_sequence=0
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(summary["ha_csv_boot_sequences"], [0])
 
     def test_crc_resynchronization_preserves_raw_context(self) -> None:
         state = StreamState(role="request")
@@ -193,7 +466,9 @@ class ParseChunkTests(unittest.TestCase):
             Chunk(477, 1, b"\x00\x00\x00\xff", timestamp_ms=1786118400123),
         )
         self.assertEqual(frames, [])
-        self.assertEqual(state.startup_markers, [(477, 477, 1786118400123)])
+        self.assertEqual(
+            state.startup_markers, [(477, 477, 1786118400123, None)]
+        )
         self.assertEqual(
             timestamp_iso8601(1786118400123), "2026-08-07T16:00:00.123Z"
         )

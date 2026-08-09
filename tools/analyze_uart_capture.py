@@ -56,6 +56,32 @@ CAPTURE_HEARTBEAT_RE = re.compile(
     r"child_alive=(?P<child_alive>true|false) "
     r"seconds_since_output=(?P<seconds_since_output>[0-9.]+)"
 )
+PROJECT_VERSION_RE = re.compile(
+    r"Project (?P<project>\S+) version (?P<version>\S+)"
+)
+BOOT_RECORD_RE = re.compile(
+    r"BOOT session=(?P<boot_id>\d+) buffered as seq=(?P<sequence>\d+)"
+    r"(?: uptime_ms=(?P<uptime_ms>\d+))?"
+)
+DEVICE_HEARTBEAT_RE = re.compile(
+    r"boot=(?P<boot_id>\d+) #(?P<sequence>\d+) HEARTBEAT "
+    r"uptime_ms=(?P<uptime_ms>\d+)"
+)
+HA_CSV_REQUIRED_FIELDS = (
+    "ha_timestamp",
+    "boot_id",
+    "record_type",
+    "sequence",
+    "uptime_ms",
+    "source",
+    "gpio",
+    "byte_count",
+    "overwritten_total",
+    "buffer_remaining",
+    "message",
+    "hex",
+)
+UINT32_MAX = (1 << 32) - 1
 
 
 def modbus_crc(data: bytes) -> int:
@@ -81,6 +107,18 @@ def timestamp_iso8601(timestamp_ms: int | None) -> str:
         dt.datetime.fromtimestamp(timestamp_ms / 1000, tz=dt.timezone.utc)
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z")
+    )
+
+
+def timestamp_from_log_line(line: str) -> int | None:
+    match = TIMESTAMP_RE.match(line)
+    if match is None:
+        return None
+    return int(
+        dt.datetime.fromisoformat(
+            match.group("timestamp").replace("Z", "+00:00")
+        ).timestamp()
+        * 1000
     )
 
 
@@ -118,6 +156,16 @@ class Chunk:
     boot_id: int = 0
     order: int = -1
     timestamp_ms: int | None = None
+    capture_time_ms: int | None = None
+    uptime_ms: int | None = None
+
+
+@dataclass
+class HACsvCapture:
+    uart_chunks: list[Chunk] = field(default_factory=list)
+    sequence_records: list[Chunk] = field(default_factory=list)
+    records: list[dict[str, object]] = field(default_factory=list)
+    summary: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +178,8 @@ class Frame:
     first_order: int = -1
     last_order: int = -1
     timestamp_ms: int | None = None
+    capture_time_ms: int | None = None
+    uptime_ms: int | None = None
 
     @property
     def address(self) -> int:
@@ -150,6 +200,8 @@ class ParseIssue:
     first_sequence: int
     last_sequence: int
     timestamp_ms: int | None
+    capture_time_ms: int | None
+    uptime_ms: int | None
     expected_length: int
     candidate_hex: str
     dropped_byte_hex: str
@@ -163,9 +215,13 @@ class StreamState:
     last_sequence: int = 0
     first_order: int = 0
     last_timestamp_ms: int | None = None
+    last_capture_time_ms: int | None = None
+    last_uptime_ms: int | None = None
     discarded_bytes: int = 0
     crc_errors: int = 0
-    startup_markers: list[tuple[int, int, int | None]] = field(default_factory=list)
+    startup_markers: list[tuple[int, int, int | None, int | None]] = field(
+        default_factory=list
+    )
     issues: list[ParseIssue] = field(default_factory=list)
 
 
@@ -298,19 +354,9 @@ def parse_chunks(lines: Iterable[str]) -> list[Chunk]:
             data=data,
             boot_id=int(match.group("boot_id") or 0),
             order=order,
-            timestamp_ms=(
-                int(
-                    dt.datetime.fromisoformat(
-                        TIMESTAMP_RE.match(line).group("timestamp").replace(
-                            "Z", "+00:00"
-                        )
-                    ).timestamp()
-                    * 1000
-                )
-                if TIMESTAMP_RE.match(line)
-                else None
-            ),
+            timestamp_ms=timestamp_from_log_line(line),
         )
+        chunk.capture_time_ms = chunk.timestamp_ms
         key = (chunk.boot_id, chunk.sequence)
         existing = chunks_by_key.get(key)
         if existing is not None and (
@@ -325,12 +371,308 @@ def parse_chunks(lines: Iterable[str]) -> list[Chunk]:
     return list(chunks_by_key.values())
 
 
+def parse_log_sequence_records(
+    lines: Iterable[str], uart_chunks: Iterable[Chunk]
+) -> list[Chunk]:
+    """Merge UART chunks with internal BOOT/HEARTBEAT sequence records."""
+    records_by_key: dict[tuple[int, int], Chunk] = {
+        (chunk.boot_id, chunk.sequence): chunk for chunk in uart_chunks
+    }
+    for order, line in enumerate(lines):
+        match = BOOT_RECORD_RE.search(line)
+        if match is None:
+            match = DEVICE_HEARTBEAT_RE.search(line)
+        if match is None:
+            continue
+        uptime_text = match.groupdict().get("uptime_ms")
+        uptime_ms = int(uptime_text) if uptime_text is not None else None
+        record = Chunk(
+            sequence=int(match.group("sequence")),
+            source=0,
+            data=b"",
+            boot_id=int(match.group("boot_id")),
+            order=order,
+            timestamp_ms=timestamp_from_log_line(line),
+            capture_time_ms=uptime_ms,
+            uptime_ms=uptime_ms,
+        )
+        key = (record.boot_id, record.sequence)
+        existing = records_by_key.get(key)
+        if existing is not None:
+            if existing.source != 0 or existing.uptime_ms != record.uptime_ms:
+                raise ValueError(
+                    "conflicting API log record at "
+                    f"boot={record.boot_id} sequence={record.sequence}"
+                )
+            continue
+        records_by_key[key] = record
+    return sorted(records_by_key.values(), key=lambda record: record.order)
+
+
+def parse_iso8601_ms(value: str) -> int:
+    parsed = dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a UTC offset")
+    return int(parsed.timestamp() * 1000)
+
+
+def parse_uint_field(row: dict[str, str], field_name: str) -> int:
+    raw_value = row.get(field_name, "")
+    if not isinstance(raw_value, str):
+        raise ValueError(f"{field_name} is missing")
+    value = raw_value.strip()
+    if not value or not value.isdecimal():
+        raise ValueError(f"{field_name} is not an unsigned decimal integer")
+    parsed = int(value)
+    if parsed > UINT32_MAX:
+        raise ValueError(f"{field_name} exceeds uint32")
+    return parsed
+
+
+def parse_ha_capture_csv(path: Path, boot_id: int | None) -> HACsvCapture:
+    """Load the append-ACK HA CSV as the authoritative capture record stream."""
+    source_bytes = path.read_bytes()
+    malformed_rows: list[dict[str, object]] = []
+    conflicts: list[dict[str, object]] = []
+    records_by_key: dict[tuple[int, int], dict[str, object]] = {}
+    total_rows = 0
+    other_boot_rows = 0
+    selected_rows = 0
+    duplicate_rows = 0
+
+    text = source_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(text.splitlines())
+    fieldnames = tuple(reader.fieldnames or ())
+    missing_fields = [
+        field_name
+        for field_name in HA_CSV_REQUIRED_FIELDS
+        if field_name not in fieldnames
+    ]
+    if missing_fields:
+        malformed_rows.append(
+            {
+                "row_number": 1,
+                "reason": "missing_header_fields",
+                "fields": missing_fields,
+            }
+        )
+
+    for row_number, row in enumerate(reader, start=2):
+        total_rows += 1
+        row_copy = {
+            str(key): "" if value is None else str(value)
+            for key, value in row.items()
+            if key is not None
+        }
+        try:
+            if row.get(None):
+                raise ValueError("row has unquoted extra CSV columns")
+            row_boot_id = parse_uint_field(row_copy, "boot_id")
+            if row_boot_id == 0:
+                raise ValueError("boot_id must be nonzero")
+            if boot_id is not None and row_boot_id != boot_id:
+                other_boot_rows += 1
+                continue
+            selected_rows += 1
+            sequence = parse_uint_field(row_copy, "sequence")
+            uptime_ms = parse_uint_field(row_copy, "uptime_ms")
+            overwritten_total = parse_uint_field(row_copy, "overwritten_total")
+            buffer_remaining = parse_uint_field(row_copy, "buffer_remaining")
+            if buffer_remaining >= 256:
+                raise ValueError("buffer_remaining is outside the 256-record ring")
+            timestamp_ms = parse_iso8601_ms(row_copy.get("ha_timestamp", ""))
+            record_type = row_copy.get("record_type", "").strip().upper()
+            source = row_copy.get("source", "").strip().upper()
+            gpio = row_copy.get("gpio", "").strip().upper()
+            byte_count = parse_uint_field(row_copy, "byte_count")
+            compact_hex = re.sub(r"[. ]", "", row_copy.get("hex", "").strip())
+            if compact_hex and not re.fullmatch(r"[0-9A-Fa-f]+", compact_hex):
+                raise ValueError("hex contains non-hexadecimal characters")
+            if len(compact_hex) % 2:
+                raise ValueError("hex contains an odd number of nibbles")
+            payload = bytes.fromhex(compact_hex)
+            message = row_copy.get("message", "").strip()
+
+            if record_type in ("BOOT", "HEARTBEAT"):
+                if source != "ONBOARD" or gpio != "INTERNAL":
+                    raise ValueError(
+                        f"{record_type} source/gpio must be ONBOARD/INTERNAL"
+                    )
+                if byte_count != 0 or payload:
+                    raise ValueError(
+                        f"{record_type} must have byte_count=0 and empty hex"
+                    )
+                if not message:
+                    raise ValueError(f"{record_type} message is empty")
+                source_number = 0
+            elif record_type == "UART":
+                if source not in ("G1", "G2"):
+                    raise ValueError("UART source must be G1 or G2")
+                source_number = int(source[1])
+                if gpio != f"GPIO{source_number}":
+                    raise ValueError("UART source and gpio disagree")
+                if not (1 <= byte_count <= 96):
+                    raise ValueError("UART byte_count is outside 1..96")
+                if len(payload) != byte_count:
+                    raise ValueError(
+                        f"UART payload length {len(payload)} != byte_count {byte_count}"
+                    )
+            else:
+                raise ValueError("record_type must be BOOT, HEARTBEAT, or UART")
+
+            normalized: dict[str, object] = {
+                "boot_id": row_boot_id,
+                "sequence": sequence,
+                "uptime_ms": uptime_ms,
+                "record_type": record_type,
+                "source": source,
+                "source_number": source_number,
+                "gpio": gpio,
+                "byte_count": byte_count,
+                "payload": payload,
+                "message": message,
+                "overwritten_total": overwritten_total,
+                "buffer_remaining": buffer_remaining,
+                "timestamp_ms": timestamp_ms,
+                "row_number": row_number,
+            }
+            key = (row_boot_id, sequence)
+            existing = records_by_key.get(key)
+            if existing is not None:
+                stable_fields = (
+                    "uptime_ms",
+                    "record_type",
+                    "source",
+                    "gpio",
+                    "byte_count",
+                    "payload",
+                    "message",
+                    "overwritten_total",
+                )
+                differences = [
+                    name for name in stable_fields if existing[name] != normalized[name]
+                ]
+                if differences:
+                    conflicts.append(
+                        {
+                            "boot_id": row_boot_id,
+                            "sequence": sequence,
+                            "first_row_number": existing["row_number"],
+                            "conflicting_row_number": row_number,
+                            "differing_fields": differences,
+                            "first_hex": bytes(existing["payload"]).hex().upper(),
+                            "conflicting_hex": payload.hex().upper(),
+                            "first_record": {
+                                name: (
+                                    bytes(existing[name]).hex().upper()
+                                    if name == "payload"
+                                    else existing[name]
+                                )
+                                for name in stable_fields
+                            },
+                            "conflicting_record": {
+                                name: (
+                                    payload.hex().upper()
+                                    if name == "payload"
+                                    else normalized[name]
+                                )
+                                for name in stable_fields
+                            },
+                        }
+                    )
+                else:
+                    duplicate_rows += 1
+                continue
+            records_by_key[key] = normalized
+        except (ValueError, TypeError) as error:
+            malformed_rows.append(
+                {
+                    "row_number": row_number,
+                    "reason": str(error),
+                    "row": row_copy,
+                }
+            )
+
+    selected_records = sorted(
+        records_by_key.values(), key=lambda record: int(record["row_number"])
+    )
+    sequence_records = [
+        Chunk(
+            sequence=int(record["sequence"]),
+            source=int(record["source_number"]),
+            data=bytes(record["payload"]),
+            boot_id=int(record["boot_id"]),
+            order=int(record["row_number"]),
+            timestamp_ms=int(record["timestamp_ms"]),
+            capture_time_ms=int(record["uptime_ms"]),
+            uptime_ms=int(record["uptime_ms"]),
+        )
+        for record in selected_records
+    ]
+    uart_chunks = [
+        chunk
+        for chunk, record in zip(sequence_records, selected_records)
+        if record["record_type"] == "UART"
+    ]
+    boot_records = [
+        record for record in selected_records if record["record_type"] == "BOOT"
+    ]
+    heartbeat_records = [
+        record
+        for record in selected_records
+        if record["record_type"] == "HEARTBEAT"
+    ]
+    overwritten_values = [
+        int(record["overwritten_total"]) for record in selected_records
+    ]
+    summary: dict[str, object] = {
+        "analysis_chunk_source": "ha_csv",
+        "ha_csv_path": str(path),
+        "ha_csv_bytes": len(source_bytes),
+        "ha_csv_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "ha_csv_header_fields": list(fieldnames),
+        "ha_csv_missing_header_fields": missing_fields,
+        "ha_csv_total_data_rows": total_rows,
+        "ha_csv_selected_boot_id": boot_id,
+        "ha_csv_selected_data_rows": selected_rows,
+        "ha_csv_other_boot_rows": other_boot_rows,
+        "ha_csv_unique_record_count": len(selected_records),
+        "ha_csv_uart_record_count": len(uart_chunks),
+        "ha_csv_boot_record_count": len(boot_records),
+        "ha_csv_boot_sequences": [int(record["sequence"]) for record in boot_records],
+        "ha_csv_first_record_type": (
+            str(selected_records[0]["record_type"]) if selected_records else None
+        ),
+        "ha_csv_heartbeat_record_count": len(heartbeat_records),
+        "ha_csv_heartbeat_sequences": [
+            int(record["sequence"]) for record in heartbeat_records
+        ],
+        "ha_csv_duplicate_record_count": duplicate_rows,
+        "ha_csv_conflicting_duplicate_count": len(conflicts),
+        "ha_csv_conflicting_duplicates": conflicts,
+        "ha_csv_malformed_row_count": len(malformed_rows),
+        "ha_csv_malformed_rows": malformed_rows,
+        "ha_csv_max_overwritten_total": max(overwritten_values, default=None),
+        "ha_csv_last_buffer_remaining": (
+            int(selected_records[-1]["buffer_remaining"]) if selected_records else None
+        ),
+    }
+    return HACsvCapture(
+        uart_chunks=uart_chunks,
+        sequence_records=sequence_records,
+        records=selected_records,
+        summary=summary,
+    )
+
+
 def feed(state: StreamState, chunk: Chunk) -> list[Frame]:
     if not state.data:
         state.first_sequence = chunk.sequence
         state.first_order = chunk.order
     state.last_sequence = chunk.sequence
     state.last_timestamp_ms = chunk.timestamp_ms
+    state.last_capture_time_ms = chunk.capture_time_ms
+    state.last_uptime_ms = chunk.uptime_ms
     state.data.extend(chunk.data)
     frames: list[Frame] = []
 
@@ -341,7 +683,12 @@ def feed(state: StreamState, chunk: Chunk) -> list[Frame]:
                 if len(state.data) < len(WIFI_MODULE_STARTUP_MARKER):
                     break
                 state.startup_markers.append(
-                    (state.first_sequence, chunk.sequence, chunk.timestamp_ms)
+                    (
+                        state.first_sequence,
+                        chunk.sequence,
+                        chunk.timestamp_ms,
+                        chunk.uptime_ms,
+                    )
                 )
                 del state.data[: len(WIFI_MODULE_STARTUP_MARKER)]
                 state.first_sequence = chunk.sequence
@@ -357,6 +704,8 @@ def feed(state: StreamState, chunk: Chunk) -> list[Frame]:
                     first_sequence=state.first_sequence,
                     last_sequence=chunk.sequence,
                     timestamp_ms=chunk.timestamp_ms,
+                    capture_time_ms=chunk.capture_time_ms,
+                    uptime_ms=chunk.uptime_ms,
                     expected_length=length,
                     candidate_hex=bytes(state.data[:32]).hex().upper(),
                     dropped_byte_hex=f"{state.data[0]:02X}",
@@ -378,6 +727,8 @@ def feed(state: StreamState, chunk: Chunk) -> list[Frame]:
                     first_sequence=state.first_sequence,
                     last_sequence=chunk.sequence,
                     timestamp_ms=chunk.timestamp_ms,
+                    capture_time_ms=chunk.capture_time_ms,
+                    uptime_ms=chunk.uptime_ms,
                     expected_length=length,
                     candidate_hex=candidate.hex().upper(),
                     dropped_byte_hex=f"{state.data[0]:02X}",
@@ -400,6 +751,8 @@ def feed(state: StreamState, chunk: Chunk) -> list[Frame]:
                 first_order=state.first_order,
                 last_order=chunk.order,
                 timestamp_ms=chunk.timestamp_ms,
+                capture_time_ms=chunk.capture_time_ms,
+                uptime_ms=chunk.uptime_ms,
             )
         )
         del state.data[:length]
@@ -548,6 +901,10 @@ def sequence_integrity(
                     "before_log_order": current_chunk.order,
                     "after_timestamp_ms": previous_chunk.timestamp_ms,
                     "before_timestamp_ms": current_chunk.timestamp_ms,
+                    "after_capture_time_ms": previous_chunk.capture_time_ms,
+                    "before_capture_time_ms": current_chunk.capture_time_ms,
+                    "after_uptime_ms": previous_chunk.uptime_ms,
+                    "before_uptime_ms": current_chunk.uptime_ms,
                     "after_timestamp_iso8601": timestamp_iso8601(
                         previous_chunk.timestamp_ms
                     ),
@@ -571,6 +928,10 @@ def sequence_integrity(
                     "current_log_order": chunk.order,
                     "previous_timestamp_ms": previous.timestamp_ms,
                     "current_timestamp_ms": chunk.timestamp_ms,
+                    "previous_capture_time_ms": previous.capture_time_ms,
+                    "current_capture_time_ms": chunk.capture_time_ms,
+                    "previous_uptime_ms": previous.uptime_ms,
+                    "current_uptime_ms": chunk.uptime_ms,
                     "previous_timestamp_iso8601": timestamp_iso8601(
                         previous.timestamp_ms
                     ),
@@ -600,6 +961,7 @@ def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
     starts: list[re.Match[str]] = []
     ends: list[re.Match[str]] = []
     transport_events: list[dict[str, object]] = []
+    project_versions: list[dict[str, str]] = []
     for line in lines:
         start = CAPTURE_START_RE.match(line)
         if start:
@@ -607,6 +969,14 @@ def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
         end = CAPTURE_END_RE.match(line)
         if end:
             ends.append(end)
+        project_version = PROJECT_VERSION_RE.search(line)
+        if project_version:
+            candidate = {
+                "project": project_version.group("project"),
+                "version": project_version.group("version"),
+            }
+            if candidate not in project_versions:
+                project_versions.append(candidate)
         for kind, pattern in (
             ("connect_attempt", CONNECT_ATTEMPT_RE),
             ("disconnected", DISCONNECTED_RE),
@@ -657,6 +1027,8 @@ def parse_capture_metadata(lines: Iterable[str]) -> dict[str, object]:
             event["kind"] == "capture_heartbeat" for event in transport_events
         ),
         "capture_transport_events": transport_events,
+        "capture_reported_projects": project_versions,
+        "capture_reported_project_count": len(project_versions),
     }
     if len(starts) == 1:
         start_time = dt.datetime.fromisoformat(
@@ -705,6 +1077,30 @@ def main() -> int:
     parser.add_argument("--frames-csv", type=Path)
     parser.add_argument("--registers-csv", type=Path)
     parser.add_argument(
+        "--ha-csv",
+        type=Path,
+        help=(
+            "use the Home Assistant append-and-ACK CSV as the authoritative "
+            "record stream; the positional API log remains capture metadata "
+            "and transport diagnostics"
+        ),
+    )
+    parser.add_argument(
+        "--boot-id",
+        type=int,
+        help=(
+            "select one uint32 boot session from --ha-csv; when omitted, a "
+            "single boot ID in the API diagnostic log is selected automatically"
+        ),
+    )
+    parser.add_argument(
+        "--expected-project-version",
+        help=(
+            "require the device runtime log to report this ESPHome project "
+            "version (for example 0.1.0-alpha.10)"
+        ),
+    )
+    parser.add_argument(
         "--summary-json",
         type=Path,
         help="write the summary plus a sibling .sha256 integrity file",
@@ -731,6 +1127,15 @@ def main() -> int:
             "than this interval, including capture boundaries"
         ),
     )
+    parser.add_argument(
+        "--max-checkpoint-interval-seconds",
+        type=float,
+        default=45.0,
+        help=(
+            "fail HA CSV strict validation when BOOT/HEARTBEAT device-uptime "
+            "checkpoints are farther apart than this interval"
+        ),
+    )
     args = parser.parse_args()
 
     register_catalog = load_register_catalog(args.mapping_csv)
@@ -739,9 +1144,33 @@ def main() -> int:
     capture_bytes = args.capture.read_bytes()
     capture_lines = capture_bytes.decode("utf-8").splitlines()
     capture_metadata = parse_capture_metadata(capture_lines)
-    chunks = parse_chunks(capture_lines)
+    diagnostic_chunks = parse_chunks(capture_lines)
+    diagnostic_sequence_records = parse_log_sequence_records(
+        capture_lines, diagnostic_chunks
+    )
+    diagnostic_sequence_gaps, diagnostic_sequence_out_of_order = sequence_integrity(
+        diagnostic_sequence_records
+    )
+    selected_boot_id = args.boot_id
+    if selected_boot_id is not None and not (1 <= selected_boot_id <= UINT32_MAX):
+        parser.error("--boot-id must be in the uint32 range 1..4294967295")
+    diagnostic_boot_ids = sorted(
+        {record.boot_id for record in diagnostic_sequence_records}
+    )
+    if args.ha_csv and selected_boot_id is None and len(diagnostic_boot_ids) == 1:
+        selected_boot_id = diagnostic_boot_ids[0]
+
+    ha_capture: HACsvCapture | None = None
+    if args.ha_csv:
+        ha_capture = parse_ha_capture_csv(args.ha_csv, selected_boot_id)
+        chunks = ha_capture.uart_chunks
+        sequence_records = ha_capture.sequence_records
+    else:
+        chunks = diagnostic_chunks
+        sequence_records = diagnostic_sequence_records
+
     boot_log_order: dict[int, int] = {}
-    for chunk in chunks:
+    for chunk in sequence_records:
         boot_log_order.setdefault(chunk.boot_id, chunk.order)
     ordered_chunks = sorted(
         chunks,
@@ -773,7 +1202,7 @@ def main() -> int:
         )
     )
 
-    sequence_gaps, sequence_out_of_order = sequence_integrity(chunks)
+    sequence_gaps, sequence_out_of_order = sequence_integrity(sequence_records)
 
     pending: deque[Frame] = deque()
     frame_rows: list[dict[str, object]] = []
@@ -788,7 +1217,12 @@ def main() -> int:
 
     for (boot_id, source), state in states.items():
         if source == 1:
-            for first_sequence, last_sequence, timestamp_ms in state.startup_markers:
+            for (
+                first_sequence,
+                last_sequence,
+                timestamp_ms,
+                uptime_ms,
+            ) in state.startup_markers:
                 frame_rows.append(
                     {
                         "boot_id": boot_id,
@@ -798,9 +1232,14 @@ def main() -> int:
                         "kind": "wifi_module_startup_marker",
                         "operation": "startup_marker",
                         "semantic_status": "fully_parsed",
-                        "completion_timestamp_ms": timestamp_ms or "",
+                        "completion_timestamp_ms": (
+                            timestamp_ms if timestamp_ms is not None else ""
+                        ),
                         "completion_timestamp_iso8601": timestamp_iso8601(
                             timestamp_ms
+                        ),
+                        "completion_uptime_ms": (
+                            uptime_ms if uptime_ms is not None else ""
                         ),
                         "frame_hex": WIFI_MODULE_STARTUP_MARKER.hex().upper(),
                         "crc_valid": "",
@@ -818,6 +1257,9 @@ def main() -> int:
                     "completion_timestamp_iso8601": timestamp_iso8601(
                         issue.timestamp_ms
                     ),
+                        "completion_uptime_ms": (
+                            issue.uptime_ms if issue.uptime_ms is not None else ""
+                        ),
                     "kind": issue.kind,
                     "operation": "stream_resynchronization",
                     "semantic_status": "parse_error",
@@ -838,6 +1280,11 @@ def main() -> int:
                     "completion_timestamp_iso8601": timestamp_iso8601(
                         state.last_timestamp_ms
                     ),
+                    "completion_uptime_ms": (
+                        state.last_uptime_ms
+                        if state.last_uptime_ms is not None
+                        else ""
+                    ),
                     "kind": "incomplete_stream_tail",
                     "operation": "stream_reassembly",
                     "semantic_status": "incomplete",
@@ -850,13 +1297,13 @@ def main() -> int:
             )
 
     for frame in frames:
-        if frame.timestamp_ms is not None:
+        if frame.capture_time_ms is not None:
             retained: deque[Frame] = deque()
             while pending:
                 request = pending.popleft()
                 if (
-                    request.timestamp_ms is not None
-                    and frame.timestamp_ms - request.timestamp_ms > 1000
+                    request.capture_time_ms is not None
+                    and frame.capture_time_ms - request.capture_time_ms > 1000
                 ):
                     expired_requests += 1
                 else:
@@ -875,6 +1322,9 @@ def main() -> int:
             "semantic_status": frame_semantic_status(frame),
             "completion_timestamp_ms": frame.timestamp_ms or "",
             "completion_timestamp_iso8601": timestamp_iso8601(frame.timestamp_ms),
+            "completion_uptime_ms": (
+                frame.uptime_ms if frame.uptime_ms is not None else ""
+            ),
         }
 
         if not frame_structure_valid(frame):
@@ -915,6 +1365,11 @@ def main() -> int:
                             "completion_timestamp_ms": frame.timestamp_ms or "",
                             "completion_timestamp_iso8601": timestamp_iso8601(
                                 frame.timestamp_ms
+                            ),
+                            "completion_uptime_ms": (
+                                frame.uptime_ms
+                                if frame.uptime_ms is not None
+                                else ""
                             ),
                             "register": start + index // 2,
                             "register_label": f"D{start + index // 2}",
@@ -1004,6 +1459,11 @@ def main() -> int:
                                 "completion_timestamp_iso8601": timestamp_iso8601(
                                     frame.timestamp_ms
                                 ),
+                                "completion_uptime_ms": (
+                                    frame.uptime_ms
+                                    if frame.uptime_ms is not None
+                                    else ""
+                                ),
                                 "register": register_address,
                                 "register_label": f"D{register_address}",
                                 "mapped_fields": "|".join(
@@ -1042,18 +1502,44 @@ def main() -> int:
             if frame_structure_valid(frame) and 1 <= frame.address <= 247
         }
     )
+    diagnostic_summary: dict[str, object] = {
+        "analysis_chunk_source": "api_log" if ha_capture is None else "ha_csv",
+        "api_log_chunk_count": len(diagnostic_chunks),
+        "api_log_record_count": len(diagnostic_sequence_records),
+        "api_log_boot_sessions": diagnostic_boot_ids,
+        "api_log_boot_session_count": len(diagnostic_boot_ids),
+        "api_log_sequence_gap_count": len(diagnostic_sequence_gaps),
+        "api_log_missing_sequence_count": sum(
+            int(gap["missing_count"]) for gap in diagnostic_sequence_gaps
+        ),
+        "api_log_sequence_gaps": diagnostic_sequence_gaps,
+        "api_log_sequence_out_of_order_count": len(
+            diagnostic_sequence_out_of_order
+        ),
+        "api_log_sequence_out_of_order": diagnostic_sequence_out_of_order,
+    }
+    if ha_capture is not None:
+        diagnostic_summary.update(ha_capture.summary)
+        diagnostic_summary["ha_csv_selected_boot_matches_api_log"] = (
+            selected_boot_id is not None
+            and selected_boot_id in diagnostic_boot_ids
+        )
+
     summary = {
         "analysis_timestamp_iso8601": timestamp_iso8601(
             int(dt.datetime.now(tz=dt.timezone.utc).timestamp() * 1000)
         ),
-        "capture_path": str(args.capture.resolve()),
+        "capture_path": str(args.capture),
         "capture_bytes": len(capture_bytes),
         "capture_sha256": hashlib.sha256(capture_bytes).hexdigest(),
         "chunks": len(chunks),
-        "boot_sessions": sorted({chunk.boot_id for chunk in chunks}),
-        "boot_session_count": len({chunk.boot_id for chunk in chunks}),
-        "first_sequence": chunks[0].sequence if chunks else None,
-        "last_sequence": chunks[-1].sequence if chunks else None,
+        "capture_records": len(sequence_records),
+        "boot_sessions": sorted({chunk.boot_id for chunk in sequence_records}),
+        "boot_session_count": len(
+            {chunk.boot_id for chunk in sequence_records}
+        ),
+        "first_sequence": sequence_records[0].sequence if sequence_records else None,
+        "last_sequence": sequence_records[-1].sequence if sequence_records else None,
         "sequence_gap_count": len(sequence_gaps),
         "sequence_gaps": sequence_gaps,
         "missing_sequence_count": sum(
@@ -1111,10 +1597,11 @@ def main() -> int:
                 "last": last,
                 "completion_timestamp_ms": timestamp_ms,
                 "completion_timestamp_iso8601": timestamp_iso8601(timestamp_ms),
+                "completion_uptime_ms": uptime_ms,
             }
             for (boot_id, source), state in states.items()
             if source == 1
-            for first, last, timestamp_ms in state.startup_markers
+            for first, last, timestamp_ms, uptime_ms in state.startup_markers
         ],
         "parse_issue_count": sum(len(state.issues) for state in states.values())
         + sum(bool(state.data) for state in states.values()),
@@ -1129,6 +1616,7 @@ def main() -> int:
                 "completion_timestamp_iso8601": timestamp_iso8601(
                     issue.timestamp_ms
                 ),
+                "completion_uptime_ms": issue.uptime_ms,
                 "expected_length": issue.expected_length,
                 "dropped_byte_hex": issue.dropped_byte_hex,
                 "candidate_hex": issue.candidate_hex,
@@ -1145,6 +1633,7 @@ def main() -> int:
             }
             for (boot_id, source), state in states.items()
         },
+        **diagnostic_summary,
         **capture_metadata,
     }
 
@@ -1180,16 +1669,23 @@ def main() -> int:
         f"D{address}" for address in missing_read_register_addresses
     ]
 
-    timestamp_missing_chunks = [
-        chunk for chunk in chunks if chunk.timestamp_ms is None
+    timestamp_missing_chunks = [chunk for chunk in chunks if chunk.timestamp_ms is None]
+    capture_time_missing_chunks = [
+        chunk for chunk in chunks if chunk.capture_time_ms is None
     ]
     idle_segments: list[dict[str, object]] = []
     start_ms = capture_metadata.get("capture_start_timestamp_ms")
     end_ms = capture_metadata.get("capture_end_timestamp_ms")
-    timestamped_chunks = [
-        chunk for chunk in chunks if chunk.timestamp_ms is not None
-    ]
-    if timestamped_chunks and isinstance(start_ms, int):
+    wall_clock_chunks = sorted(
+        (chunk for chunk in chunks if chunk.timestamp_ms is not None),
+        key=lambda chunk: (int(chunk.timestamp_ms), chunk.order),
+    )
+    timestamped_chunks = (
+        [chunk for chunk in ordered_chunks if chunk.timestamp_ms is not None]
+        if ha_capture is not None
+        else wall_clock_chunks
+    )
+    if ha_capture is None and timestamped_chunks and isinstance(start_ms, int):
         idle_segments.append(
             {
                 "kind": "capture_start_to_first_chunk",
@@ -1198,20 +1694,60 @@ def main() -> int:
                 ),
                 "before_sequence": None,
                 "after_sequence": timestamped_chunks[0].sequence,
+                "time_basis": "wall_clock",
             }
         )
-    for previous, current in zip(timestamped_chunks, timestamped_chunks[1:]):
+    capture_timed_chunks = (
+        [chunk for chunk in ordered_chunks if chunk.capture_time_ms is not None]
+        if ha_capture is not None
+        else wall_clock_chunks
+    )
+    if ha_capture is not None and sequence_records and capture_timed_chunks:
+        boot_record = next(
+            (record for record in sequence_records if record.source == 0), None
+        )
+        if boot_record is not None and boot_record.capture_time_ms is not None:
+            idle_segments.append(
+                {
+                    "kind": "boot_to_first_uart_chunk",
+                    "seconds": (
+                        (
+                            capture_timed_chunks[0].capture_time_ms
+                            - boot_record.capture_time_ms
+                        )
+                        & UINT32_MAX
+                    )
+                    / 1000.0,
+                    "before_sequence": boot_record.sequence,
+                    "after_sequence": capture_timed_chunks[0].sequence,
+                    "time_basis": "device_uptime",
+                }
+            )
+    for previous, current in zip(capture_timed_chunks, capture_timed_chunks[1:]):
         idle_segments.append(
             {
                 "kind": "between_chunks",
-                "seconds": max(
-                    0.0, (current.timestamp_ms - previous.timestamp_ms) / 1000.0
+                "seconds": (
+                    (
+                        (current.capture_time_ms - previous.capture_time_ms)
+                        & UINT32_MAX
+                    )
+                    / 1000.0
+                    if ha_capture is not None
+                    else max(
+                        0.0,
+                        (current.capture_time_ms - previous.capture_time_ms)
+                        / 1000.0,
+                    )
                 ),
                 "before_sequence": previous.sequence,
                 "after_sequence": current.sequence,
+                "time_basis": (
+                    "device_uptime" if ha_capture is not None else "wall_clock"
+                ),
             }
         )
-    if timestamped_chunks and isinstance(end_ms, int):
+    if ha_capture is None and timestamped_chunks and isinstance(end_ms, int):
         idle_segments.append(
             {
                 "kind": "last_chunk_to_capture_end",
@@ -1220,17 +1756,89 @@ def main() -> int:
                 ),
                 "before_sequence": timestamped_chunks[-1].sequence,
                 "after_sequence": None,
+                "time_basis": "wall_clock",
             }
         )
+    device_uptime_span_seconds: float | None = None
+    checkpoint_segments: list[dict[str, object]] = []
+    if ha_capture is not None and sequence_records:
+        onboard_records = [record for record in sequence_records if record.source == 0]
+        if onboard_records:
+            first_record = sequence_records[0]
+            last_record = sequence_records[-1]
+            device_uptime_span_seconds = (
+                ((last_record.uptime_ms - first_record.uptime_ms) & UINT32_MAX)
+                / 1000.0
+            )
+            for previous, current in zip(onboard_records, onboard_records[1:]):
+                checkpoint_segments.append(
+                    {
+                        "before_sequence": previous.sequence,
+                        "after_sequence": current.sequence,
+                        "seconds": (
+                            ((current.uptime_ms - previous.uptime_ms) & UINT32_MAX)
+                            / 1000.0
+                        ),
+                    }
+                )
+            if onboard_records[-1].sequence != last_record.sequence:
+                checkpoint_segments.append(
+                    {
+                        "before_sequence": onboard_records[-1].sequence,
+                        "after_sequence": last_record.sequence,
+                        "seconds": (
+                            (
+                                last_record.uptime_ms
+                                - onboard_records[-1].uptime_ms
+                            )
+                            & UINT32_MAX
+                        )
+                        / 1000.0,
+                    }
+                )
+            if capture_timed_chunks and last_record.uptime_ms is not None:
+                idle_segments.append(
+                    {
+                        "kind": "last_uart_chunk_to_last_persisted_record",
+                        "seconds": (
+                            (
+                                last_record.uptime_ms
+                                - capture_timed_chunks[-1].capture_time_ms
+                            )
+                            & UINT32_MAX
+                        )
+                        / 1000.0,
+                        "before_sequence": capture_timed_chunks[-1].sequence,
+                        "after_sequence": last_record.sequence,
+                        "time_basis": "device_uptime",
+                    }
+                )
+    max_checkpoint_segment = max(
+        checkpoint_segments,
+        key=lambda segment: float(segment["seconds"]),
+        default=None,
+    )
     max_idle_segment = max(
         idle_segments, key=lambda segment: float(segment["seconds"]), default=None
     )
     summary["chunk_timestamp_missing_count"] = len(timestamp_missing_chunks)
+    summary["chunk_capture_time_missing_count"] = len(capture_time_missing_chunks)
     summary["max_uart_idle_seconds"] = (
         float(max_idle_segment["seconds"]) if max_idle_segment else None
     )
     summary["max_uart_idle_segment"] = max_idle_segment
     summary["max_uart_idle_limit_seconds"] = args.max_idle_seconds
+    summary["device_uptime_span_seconds"] = device_uptime_span_seconds
+    summary["checkpoint_segments"] = checkpoint_segments
+    summary["max_checkpoint_interval_seconds"] = (
+        float(max_checkpoint_segment["seconds"])
+        if max_checkpoint_segment is not None
+        else None
+    )
+    summary["max_checkpoint_interval_limit_seconds"] = (
+        args.max_checkpoint_interval_seconds
+    )
+    summary["expected_project_version"] = args.expected_project_version
 
     frame_rows.sort(
         key=lambda row: (
@@ -1252,6 +1860,7 @@ def main() -> int:
                 "last_sequence",
                 "completion_timestamp_ms",
                 "completion_timestamp_iso8601",
+                "completion_uptime_ms",
                 "kind",
                 "operation",
                 "semantic_status",
@@ -1299,6 +1908,7 @@ def main() -> int:
                 "readback_status",
                 "completion_timestamp_ms",
                 "completion_timestamp_iso8601",
+                "completion_uptime_ms",
                 "function",
                 "register",
                 "register_label",
@@ -1316,13 +1926,44 @@ def main() -> int:
         checksum_path = args.summary_json.with_name(args.summary_json.name + ".sha256")
         checksum_path.write_text(
             f"{hashlib.sha256(summary_text.encode()).hexdigest()}  "
-            f"{args.summary_json.resolve()}\n",
+            f"{args.summary_json.name}\n",
             encoding="utf-8",
             newline="\n",
         )
     print(summary_text, end="")
+    ha_integrity_failed = ha_capture is not None and (
+        selected_boot_id is None
+        or int(summary.get("api_log_boot_session_count", 0)) > 1
+        or (
+            int(summary.get("api_log_boot_session_count", 0)) == 1
+            and summary.get("ha_csv_selected_boot_matches_api_log") is not True
+        )
+        or (
+            args.boot_id is None
+            and int(summary.get("api_log_boot_session_count", 0)) != 1
+        )
+        or bool(summary.get("ha_csv_missing_header_fields"))
+        or int(summary.get("ha_csv_malformed_row_count", 0)) != 0
+        or int(summary.get("ha_csv_conflicting_duplicate_count", 0)) != 0
+        or int(summary.get("ha_csv_boot_record_count", 0)) != 1
+        or summary.get("ha_csv_boot_sequences") != [1]
+        or summary.get("ha_csv_first_record_type") != "BOOT"
+        or int(summary.get("ha_csv_heartbeat_record_count", 0)) < 1
+        or int(summary.get("ha_csv_other_boot_rows", 0)) != 0
+        or not sequence_records
+        or sequence_records[0].source != 0
+        or sequence_records[0].sequence != 1
+        or summary.get("ha_csv_max_overwritten_total") != 0
+        or summary.get("ha_csv_last_buffer_remaining") != 0
+        or float(summary.get("device_uptime_span_seconds") or 0)
+        < args.min_duration_seconds
+        or summary.get("max_checkpoint_interval_seconds") is None
+        or float(summary.get("max_checkpoint_interval_seconds") or 0)
+        > args.max_checkpoint_interval_seconds
+    )
     integrity_failed = (
-        bool(sequence_gaps)
+        ha_integrity_failed
+        or bool(sequence_gaps)
         or summary["boot_session_count"] != 1
         or bool(pending)
         or expired_requests != 0
@@ -1337,12 +1978,23 @@ def main() -> int:
         or not summary.get("capture_complete", False)
         or summary.get("git_dirty") is not False
         or summary.get("firmware_sha256") in (None, "missing")
+        or (
+            args.expected_project_version is not None
+            and summary.get("capture_reported_projects")
+            != [
+                {
+                    "project": "rjwang.makeskyblue_modbus_monitor",
+                    "version": args.expected_project_version,
+                }
+            ]
+        )
         or int(summary.get("capture_planned_duration_seconds", 0))
         < args.min_duration_seconds
         or float(summary.get("capture_elapsed_seconds", 0))
         < args.min_duration_seconds
         or not chunks
         or bool(timestamp_missing_chunks)
+        or bool(capture_time_missing_chunks)
         or max_idle_segment is None
         or float(max_idle_segment["seconds"]) > args.max_idle_seconds
         or any(

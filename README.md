@@ -5,7 +5,7 @@ the 3.3 V TTL UART between a MakeSkyBlue Wi-Fi module and its inverter. It
 reassembles and validates Modbus RTU frames, pairs requests with responses,
 caches observed registers, and publishes decoded values to Home Assistant.
 
-Version documented here: `v0.1.0-alpha.9`. This is the current parsing and HA
+Version documented here: `v0.1.0-alpha.10`. This is the current parsing and HA
 sensor candidate. It is not yet the final 24-hour, zero-unknown validation
 build.
 
@@ -30,7 +30,7 @@ it will not be hidden behind a boolean TX substitution. See
 for the captured request schedule, naming, hardware interlocks and cutover
 checklist. No direct/TX role is shipped in this release.
 
-Alpha.8 retains the alpha.6 no-transmit preview of that transition. Both pins remain RX and
+Alpha.10 retains the alpha.6 no-transmit preview of that transition. Both pins remain RX and
 the firmware pairs observed FC03 requests/responses to auto-detect the future
 TX-candidate and RX pins. HA exposes a one-way
 `PREVIEW Arm Direct Mode Permanently` switch. After it is armed, both UART
@@ -117,8 +117,12 @@ Raw lines look like:
 [I][modbus_raw]: boot=305419896 #43 G2/GPIO2 37B RAW_HEX=01.03.20...
 ```
 
-The analyzer's frames and registers CSV outputs include completion epoch
-milliseconds plus normalized UTC ISO-8601 timestamps. CRC resynchronization,
+The authoritative analyzer input is the append-and-ACK HA File CSV. The API log
+supplies the capture start/end metadata, firmware/config hashes and transport
+diagnostics, but an API subscription gap cannot be used to prove UART loss when
+the HA CSV contains every `(boot_id, sequence)` record. Pass both sources with
+`--ha-csv`. The frames and registers CSV outputs include the HA event-fired timestamp
+and device capture uptime. CRC resynchronization,
 unsupported-length data and an incomplete stream tail are emitted as explicit
 raw-context rows rather than being hidden behind aggregate counters.
 Sequence integrity reports true missing-number ranges/counts separately from
@@ -171,6 +175,8 @@ c++ -std=c++17 -Wall -Wextra -Werror -I. \
 /tmp/direct_mode_preview_test
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
 .venv/bin/python tools/analyze_uart_capture.py --strict \
+  --ha-csv captures/modbus_uart_capture.csv \
+  --expected-project-version 0.1.0-alpha.10 \
   --summary-json reports/session.json captures/session.log
 ```
 

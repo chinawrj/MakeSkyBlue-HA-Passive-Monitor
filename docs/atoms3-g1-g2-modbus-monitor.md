@@ -92,7 +92,7 @@ actions**. Every chunk is then emitted as the event
 - `uptime_ms`: device uptime at capture
 - `byte_count`: number of bytes in this chunk
 - `hex`: continuous uppercase hexadecimal bytes
-- `record_type`: `BOOT` or `UART`
+- `record_type`: `BOOT`, `UART`, or the internal RX-only `HEARTBEAT`
 - `overwritten_total`: cumulative ring overwrite count
 - `buffer_remaining`: queued records remaining after this event
 
@@ -204,6 +204,46 @@ that the File integration action completed; it is not a transaction or a
 power-loss/fsync durability guarantee. A crash between File append and helper
 update can still duplicate a row. Back up/restore the CSV and helper together,
 and let downstream consumers deduplicate by `(boot_id, sequence)`.
+
+For strict evidence, snapshot this File CSV without changing its contents and
+analyze it together with the local API metadata log:
+
+```sh
+.venv/bin/python tools/analyze_uart_capture.py --strict \
+  --ha-csv captures/modbus_uart_capture.csv \
+  --expected-project-version 0.1.0-alpha.10 \
+  --frames-csv captures/uart-24h-frames.csv \
+  --registers-csv captures/uart-24h-registers.csv \
+  --summary-json reports/final/uart-24h-strict.json \
+  captures/uart-24h.log
+```
+
+With `--ha-csv`, top-level sequence, frame, CRC and register results come only
+from the ACK-persisted records. The API log remains in the same report under
+`api_log_*` for process/transport diagnosis and supplies `CAPTURE_START`,
+`CAPTURE_END`, Git/config/firmware hashes and the planned duration. The analyzer:
+
+- selects the single boot ID observed in the API log, or an explicit
+  `--boot-id`;
+- requires exactly one BOOT/onboarding record before the first UART record;
+- requires periodic device-uptime HEARTBEAT records, a 24-hour device-uptime
+  span, and a final persisted row with `buffer_remaining=0`;
+- validates `source`/`gpio`, byte count, hex, uint32 fields and ring bounds;
+- allows byte-identical at-least-once replay while rejecting conflicting
+  duplicates with both raw payloads preserved;
+- fails strict validation if any selected row has `overwritten_total > 0`;
+- uses device `uptime_ms` for on-wire pairing, both UART window boundaries and
+  between-chunk idle timing, because the HA event timestamp can be delayed
+  while draining the RAM ring.
+
+Start a formal window by disabling the HA automation, creating a new
+header-only File CSV, rebooting the monitor, starting the API metadata log, and
+only then re-enabling the automation so the buffered BOOT drains first. Do not
+mix two boots or an already overflowed boot into one acceptance run. At the end,
+keep the automation enabled until a HEARTBEAT proves at least 86400 seconds of
+device uptime and the newest row says `buffer_remaining=0`; then disable the
+automation, wait for file size to stabilize, and take the final snapshot.
+Preserve that CSV and its SHA-256 alongside the API log and analyzer outputs.
 
 ## Capture limits
 

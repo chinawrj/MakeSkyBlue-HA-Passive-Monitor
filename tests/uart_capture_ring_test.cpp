@@ -31,6 +31,15 @@ int main() {
   assert(ring.size() == 0U);
   assert(!ring.acknowledge_staged(2U));
 
+  ring.push_heartbeat(3U, 30U);
+  assert(ring.size() == 1U);
+  assert(ring.stage_front());
+  assert(ring.staged_type() == "HEARTBEAT");
+  assert(ring.staged_source() == "ONBOARD");
+  assert(ring.staged_gpio() == "INTERNAL");
+  assert(ring.staged_hex().empty());
+  assert(ring.acknowledge_staged(3U));
+
   // A bounded ring remains live under prolonged HA outage and reports loss.
   for (uint32_t sequence = 10U;
        sequence < 10U + modbus_capture::CAPACITY; ++sequence) {

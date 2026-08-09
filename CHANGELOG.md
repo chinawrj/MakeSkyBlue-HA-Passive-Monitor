@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.0-alpha.10 - 2026-08-09
+
+- Make the Home Assistant append-and-ACK File CSV the authoritative UART record
+  stream for strict analysis while retaining the ESPHome API log for capture
+  metadata, firmware/config hashes and transport diagnostics.
+- Validate every persisted row's boot ID, uint32 sequence, record type, source,
+  GPIO, byte count, payload and 256-record ring bounds. Require exactly one
+  onboarding BOOT record and zero ring overwrites for strict acceptance.
+- Deduplicate identical at-least-once deliveries by `(boot_id, sequence)` while
+  failing conflicting duplicates with both raw payloads and row numbers.
+- Use device `uptime_ms` for request/response timeouts and between-chunk idle
+  measurement so a delayed HA ring drain cannot hide an on-wire UART gap.
+- Add a 30-second internal HEARTBEAT to the same persistent sequence stream;
+  strict validation now requires a 24-hour device-uptime span, bounded
+  checkpoint gaps, zero overwrites, and a fully drained final ring record.
+- Keep API-log sequence gaps visible as separate diagnostics without allowing
+  them to override a complete, ACK-persisted CSV stream.
+- Keep GPIO1/GPIO2 floating RX-only. This release adds no TX pin, UART write,
+  active Modbus component or bus transmission.
+
 ## 0.1.0-alpha.9 - 2026-08-09
 
 - Add a host-side capture watchdog: record a local heartbeat every 30 seconds

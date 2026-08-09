@@ -24,7 +24,7 @@ esphome:
   friendly_name: MakeSkyBlueModbusMonitor
   project:
     name: rjwang.makeskyblue_modbus_monitor
-    version: 0.1.0-alpha.9
+    version: 0.1.0-alpha.10
   includes:
     - components/uart_capture_ring.h
     - components/passive_modbus_monitor.h
@@ -47,9 +47,10 @@ esphome:
             id(boot_uptime_ms) = millis();
             modbus_capture::ring.push_boot(sequence, id(boot_uptime_ms));
             ESP_LOGW("modbus_buffer",
-                     "BOOT session=%u buffered as seq=%u, ring capacity=%u records",
+                     "BOOT session=%u buffered as seq=%u uptime_ms=%u, ring capacity=%u records",
                      static_cast<unsigned>(id(capture_boot_id)),
                      static_cast<unsigned>(sequence),
+                     static_cast<unsigned>(id(boot_uptime_ms)),
                      static_cast<unsigned>(modbus_capture::CAPACITY));
     - priority: -100
       then:
@@ -1012,6 +1013,20 @@ interval:
           call.set_brightness(brightness);
           call.perform();
 
+  # Persist a device-uptime checkpoint in the same ring/sequence stream. This
+  # is internal bookkeeping only: it never writes to either UART or GPIO.
+  - interval: 30s
+    then:
+      - lambda: |-
+          const uint32_t sequence = ++id(capture_sequence);
+          const uint32_t uptime_ms = millis();
+          modbus_capture::ring.push_heartbeat(sequence, uptime_ms);
+          ESP_LOGI("modbus_checkpoint",
+                   "boot=%u #%u HEARTBEAT uptime_ms=%u",
+                   static_cast<unsigned>(id(capture_boot_id)),
+                   static_cast<unsigned>(sequence),
+                   static_cast<unsigned>(uptime_ms));
+
   # Send the ring front at least once per second until HA explicitly ACKs that
   # exact boot-session plus uint32 sequence after HA append completion.
   # Delivery is at-least-once; downstream storage deduplicates by both values.
@@ -1052,6 +1067,11 @@ interval:
                       return std::string(
                         "BOOT: UART active before Wi-Fi; ring_capacity=256; "
                         "chunk_size=${monitor_chunk_size}; profile=${monitor_baud_rate}-8N1"
+                      );
+                    }
+                    if (modbus_capture::ring.staged_type() == "HEARTBEAT") {
+                      return std::string(
+                        "HEARTBEAT: RX-only persistence checkpoint"
                       );
                     }
                     return std::string();
