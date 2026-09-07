@@ -9,6 +9,32 @@ Version documented here: `v0.1.0-alpha.10`. This is the current parsing and HA
 sensor candidate. It is not yet the final 24-hour, zero-unknown validation
 build.
 
+Documentation review: **2026-09-07**. This update changes documentation only;
+it does not change firmware, enable transmission, or require an OTA/reboot.
+Keep the installed device in monitor mode with the original bus intact.
+
+## Documentation map and current status
+
+| Question | Read |
+| --- | --- |
+| What can the current RX-only monitor do, and where are its logs? | [Monitor operations and capture limitations](docs/atoms3-g1-g2-modbus-monitor.md) |
+| What initialization and wire transactions have actually been observed? | [Clean-room startup and protocol evidence](docs/wifi-module-startup-sequence.md) |
+| How could an independent communication master be implemented later? | [Future-role specification, initialization state machine and support matrix](docs/direct-communication-module-transition.md) |
+| How can another developer reproduce and validate on a separate bench? | [Reproduction guide](docs/reproduce-from-scratch.md) |
+| Which register meanings are confirmed, provisional or raw-only? | [178-address evidence catalog](registers/makeskyblue-observed-registers.csv) |
+
+The future-role specification is a design, **not a shipped master or proof of
+complete protocol knowledge**. The original Wi-Fi module is still the request
+sender; the inverter responds. No active role is enabled by these documents.
+
+**Known capture blocker:** the September 7 read-only HA review found a
+header-only File CSV, a missing File notifier, and capture event fields holding
+literal `return ...;` text instead of evaluated values. ACK persistence was not
+working. The current published event-variable YAML contains the same defect.
+Consequently, the append/ACK sections below describe the intended contract, not
+a validated deployment. See [the diagnostic record and prerequisites](docs/atoms3-g1-g2-modbus-monitor.md#known-capture-blocker-2026-09-07).
+Neither HA entity history nor the published alpha proves a lossless 24-hour run.
+
 ## Electrical and safety boundary
 
 - G1 is GPIO1 RX; G2 is GPIO2 RX.
@@ -64,8 +90,8 @@ that the original Wi-Fi module has been physically removed.
 - a checked-in CSV mapping between each HA entity and its stable D address;
 - WireGuard status, raw last chunks, parsed frame summary and RGB status LED.
 
-The inverter currently polls 178 register words (`0–60`, `100–216`). Every HA
-name starts with its stable `Dxxx` address. Sixty-seven addresses now have
+The original Wi-Fi module currently polls 178 register words (`0–60`, `100–216`)
+from the inverter. Every HA name starts with its stable `Dxxx` address. Sixty-seven addresses now have
 independently cross-checked semantics from local UART plus read-only IoTRix
 snapshots; another 18 retain explicit provisional labels until a controlled
 change or additional live correlation confirms them. All remaining words stay
@@ -82,6 +108,12 @@ but its captured value is consistently 0 while the actual RTU frame address is
 unverified register encoding.
 
 ## Build, OTA and online log
+
+The build/upload commands are for a separately authorized installation, not
+instructions to update the currently installed monitor. For this documentation
+delivery, do not upload, reboot, arm the preview, change HA actions, or unplug
+the original module. The known persistence blocker must be resolved and tested
+in a future release before attempting formal capture acceptance.
 
 Create local configuration files from the sanitized templates:
 
@@ -117,7 +149,8 @@ Raw lines look like:
 [I][modbus_raw]: boot=305419896 #43 G2/GPIO2 37B RAW_HEX=01.03.20...
 ```
 
-The authoritative analyzer input is the append-and-ACK HA File CSV. The API log
+The intended authoritative analyzer input is a **validated** append-and-ACK HA
+File CSV; the currently audited header-only file does not qualify. The API log
 supplies the capture start/end metadata, firmware/config hashes and transport
 diagnostics, but an API subscription gap cannot be used to prove UART loss when
 the HA CSV contains every `(boot_id, sequence)` record. Pass both sources with
@@ -153,7 +186,7 @@ YAML-managed HA installations can reuse the matching
 [`home-assistant/makeskyblue_uart_capture.yaml`](home-assistant/makeskyblue_uart_capture.yaml)
 package after creating the File integration entity.
 
-The HA event drain is at-least-once. AtomS3 retains the ring front and retries
+The intended HA event drain is at-least-once. AtomS3 retains the ring front and retries
 it every second until HA acknowledges that exact boot-session plus `uint32`
 sequence after the
 File integration append. Duplicate events are possible if the append succeeds

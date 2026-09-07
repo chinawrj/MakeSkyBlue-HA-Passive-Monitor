@@ -1,5 +1,19 @@
 # Changelog
 
+## Documentation review - 2026-09-07
+
+- Reorganize the documentation around the shipped RX-only monitor, clean-room
+  protocol evidence, separate-bench reproduction and a future independent master.
+- Specify future initialization, bounded read scheduling, time synchronization,
+  opt-in control, recovery, observability and acceptance gates; distinguish
+  observed behavior from design requirements and unverified cold-start behavior.
+- Include the observed D36 write in the support matrix; preserve unknown bits,
+  unconfirmed D10 application and the panel `d` versus Modbus `D` distinction.
+- Document the HA File/event-variable persistence blocker and the limits of
+  Recorder-derived packet reviews. Do not claim complete 24-hour acceptance.
+- Documentation only: alpha.10 firmware, parser, configuration, register catalog
+  and installed hardware remain unchanged. No flashing, reboot or bus writes.
+
 ## 0.1.0-alpha.10 - 2026-08-09
 
 - Make the Home Assistant append-and-ACK File CSV the authoritative UART record

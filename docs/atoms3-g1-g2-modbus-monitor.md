@@ -5,6 +5,73 @@ The matching ESPHome firmware is
 It is a passive two-channel TTL UART monitor: GPIO1 and GPIO2 are configured as
 receive-only inputs and the firmware never transmits on either pin.
 
+Documentation-only review, 2026-09-07: keep the currently installed monitor and
+original bus unchanged. Do not run the flashing, reboot, preview-arm or HA setup
+procedures below on that installation for this documentation update. They are
+reference procedures for a separately authorized installation/test window.
+
+## Known capture blocker (2026-09-07)
+
+The append/ACK workflow below is the intended storage contract, **not a working
+capture guarantee for the current published YAML or audited installation**.
+A read-only review of HA's retained records found:
+
+| Evidence | Finding | Consequence |
+| --- | --- | --- |
+| File CSV | 122-byte header, zero data rows | No authoritative UART capture in this file |
+| File integration | Expected `notify.modbus_uart_log` entity absent | The package alone does not create the notifier |
+| Capture event payload | 1,419,095 events with identical literal `return ...;` field values | `sequence` and `hex` are not evaluated record data |
+| Device diagnostics at snapshot | ACK 0; invalid ACK 3,126,513; ring overwritten 2,008,010 | Persistence failed and the volatile ring lost records |
+| Recorder last-chunk history | 178,282 absent sequence values | Incomplete historical evidence, not proof of on-wire byte loss |
+
+The published `homeassistant.event.variables` block uses untagged C++-looking
+strings (for example `boot_id: return id(capture_boot_id);`) rather than evaluated
+lambda values. The observed HA payload contains those strings. This is a
+separate blocker from the missing File notifier: configuring a notifier alone
+cannot make these literal payloads valid. A future fix must validate actual
+runtime field values and end-to-end append/ACK behavior, not just compilation.
+This documentation update does **not** apply that fix or flash any device.
+
+Before a future formal capture, verify real numeric boot/sequence/uptime values,
+valid UART hex and byte count, BOOT/UART/HEARTBEAT records, notifier existence,
+growing data rows, matching ACK progress, and zero ring overwrite. If any check
+fails, stop acceptance preparation; do not silently substitute entity history.
+Reading current states, existing events, automation traces and file metadata is
+sufficient for diagnosis; do not test by invoking device actions or changing
+the existing bus. A fresh acceptance run requires a separately authorized,
+published and validated correction.
+
+### Historical packet review, not a 24-hour acceptance
+
+The retained Recorder window was 2026-08-28 04:12:00 to 2026-09-07 07:27:45
+(UTC+08:00). Its 530,230 UART-bearing state rows yielded 342,975 structurally
+valid, CRC-valid known frames: FC03 325,440; FC06 114; FC10 17,421. The latest
+24-hour subset yielded 25,611 known frames, with no new device error increments.
+No new packet type was confirmed; missing records prevent a claim that none
+occurred in the omitted data.
+
+| Time (UTC+08:00) / direction / sequence | Raw hex | Interpretation |
+| --- | --- | --- |
+| Aug 29 10:40:59.933 / G1 / 1405792 | `01030197003275F3` | CRC-invalid FC03-shaped request; computed CRC bytes `740F`, received `75F3` |
+| Aug 30 03:41:03.140 / G2 / completion 1453646 | `00BF400000` | Fragment-derived candidate with invalid response address 0 |
+| Aug 30 08:52:28.770 / G2 / completion 1471601 | `FFFF000000` | Fragment-derived candidate with invalid response address 255 |
+
+The first raw chunk differs by one bit from the normal D151 request
+`01030097003275F3`. Offline replay followed by a valid read reproduces the
+device's 3 unknown-function steps, 5 CRC failures and 8 discarded bytes. Those
+are resynchronization counters, **not three new packets**; the physical cause
+is unproven. The other two candidates do not establish valid on-wire messages.
+Neither a CRC-invalid address nor a CRC coincidence grants support for a new
+register or function. Original raw and neighboring context remain in the local,
+checksummed review evidence; private HA database exports are not redistributed.
+
+Use a validated File CSV for completeness evidence, the API log for capture
+metadata/transport diagnostics, and HA Recorder state history only as a labeled,
+potentially lossy fallback. Do not invent BOOT, uptime or CAPTURE_START metadata
+for Recorder-derived logs. Keep device counters separate from offline errors
+caused by missing state snapshots. A genuine gap fails capture integrity even
+when its cause is storage rather than the electrical bus.
+
 The installed unit does not require USB. Its primary and optional backup Wi-Fi
 networks are loaded from ignored local files created from the repository's
 sanitized examples. Physical USB serial logging is disabled; logs, UART
@@ -21,9 +88,10 @@ The AtomS3 HY2.0-4P connector is, in connector color order:
 | Yellow | G2 / GPIO2 | Connect to the second UART signal |
 | White | G1 / GPIO1 | Connect to the first UART signal |
 
-A typical full-duplex TTL UART hookup is monitored-device TX to G1 and
-monitored-device RX to G2. The names are intentionally neutral because the
-actual direction depends on which device on the bus is used as the reference.
+In this project's observed hookup, Wi-Fi-module TX / inverter RX is tapped by
+G1, and inverter TX / Wi-Fi-module RX by G2. Both AtomS3 pins remain inputs.
+Do not reverse this interpretation by changing which endpoint is called the
+"monitored device"; record the actual endpoints with each capture.
 
 Only connect 3.3 V TTL UART signals directly. Do not connect RS485 A/B, RS232,
 5 V TTL, or an inverter power rail directly to GPIO1/GPIO2. RS485 requires an
@@ -37,7 +105,8 @@ this repository. UART capture cannot auto-detect the baud rate without losing
 data. If the monitored link differs, update the substitutions at the top of the
 ESPHome file before flashing.
 
-At 9600 baud, 8 ms of idle is treated as a frame boundary. Captures longer than
+At 9600 baud, 8 ms of idle triggers a capture chunk boundary, not a guaranteed
+Modbus frame boundary. Captures longer than
 96 bytes are split into ordered chunks. No bytes are intentionally discarded;
 use the global `sequence` field to preserve the arrival order across G1 and G2.
 
@@ -252,7 +321,8 @@ as HA entities. Data arriving without HA is retained only while it remains in
 the volatile ring; ring overwrite is visible through `UART Ring Overwritten
 Records`.
 
-This design provides at-least-once delivery while the AtomS3 remains powered:
+With correctly evaluated events and a working HA append/ACK chain, the design
+aims for at-least-once delivery while records remain in powered RAM:
 records are removed only after an explicit HA persistence ACK. The AtomS3 has
 no nonvolatile capture storage, so a reboot/power loss clears pending RAM, and
 a sufficiently long outage can overflow 256 records. UART hardware FIFO
